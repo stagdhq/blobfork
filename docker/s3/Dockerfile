@@ -2,7 +2,9 @@
 # 4567, checking signatures, and blobfork in front of it on 4566.
 #
 #   docker build -f docker/s3/Dockerfile -t blobfork-s3 .
-FROM golang:1.27.1-alpine AS build
+
+# The build runs on the builder's platform and cross-compiles for the image's.
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS build
 
 WORKDIR /src
 
@@ -12,7 +14,8 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" -o /blobfork ./cmd/blobfork
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-s -w -X main.version=${VERSION}" -o /blobfork ./cmd/blobfork
 
 FROM floci/floci:2.4.0
 

@@ -1,0 +1,51 @@
+# A release, on a v* tag: blobfork for macOS, Linux and Windows (amd64,
+# arm64) and checksums.txt, attached to the tag's GitHub release (go tool
+# task dist) with notes from its commits (scripts/release-notes.sh). The
+# images come from image.yaml, on the same tag.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git describe names the version; the notes need the earlier tags.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Build
+        run: go tool task dist
+
+      - name: The GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The notes, from the tag's message and the commits since the last tag.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          fi
+
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

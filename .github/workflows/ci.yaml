@@ -1,0 +1,51 @@
+# Every push to main and every pull request: formatted, vetted, built, and
+# tested. The tests start Azurite and two Flocis with Docker, which the runner
+# has; both images are built too, not pushed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check
+        run: go tool task check
+
+  images:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        front: [azure, s3]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/${{ matrix.front }}/Dockerfile
+          push: false
+          cache-from: type=gha,scope=${{ matrix.front }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.front }}

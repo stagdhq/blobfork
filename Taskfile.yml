@@ -1,0 +1,68 @@
+# Tasks for blobfork. Task is pinned in go.mod, so `go tool task <name>`
+# works with nothing but Go installed. `go tool task --list` shows them all.
+version: "3"
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build bin/blobfork
+    cmds:
+      - go build -ldflags "{{.LDFLAGS}}" -o bin/blobfork ./cmd/blobfork
+
+  fmt:
+    desc: Format the Go
+    cmds:
+      - gofmt -w cmd internal
+
+  test:
+    desc: Run the tests (they start Azurite and Floci with Docker)
+    cmds:
+      - go test ./...
+
+  check:
+    desc: "What CI runs: formatting, vet, tests"
+    cmds:
+      - cmd: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; echo "run: task fmt"; exit 1; fi
+      - go vet ./...
+      - go test -count=1 ./...
+
+  dist:
+    desc: "Release files into dist/: blobfork for macOS, Linux and Windows (amd64, arm64), checksums.txt"
+    cmds:
+      - rm -rf dist && mkdir -p dist
+      - |
+        for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+          os=${target%/*}
+          arch=${target#*/}
+          dir=$(mktemp -d)
+          CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "{{.LDFLAGS}}" -o "$dir/blobfork" ./cmd/blobfork
+          cp LICENSE README.md "$dir/"
+          tar -czf "dist/blobfork_${os}_${arch}.tar.gz" -C "$dir" blobfork LICENSE README.md
+          rm -rf "$dir"
+        done
+      - |
+        for arch in amd64 arm64; do
+          dir=$(mktemp -d)
+          CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "{{.LDFLAGS}}" -o "$dir/blobfork.exe" ./cmd/blobfork
+          cp LICENSE README.md "$dir/"
+          zip -q -j "dist/blobfork_windows_${arch}.zip" "$dir/blobfork.exe" "$dir/LICENSE" "$dir/README.md"
+          rm -rf "$dir"
+        done
+      - cd dist && if command -v sha256sum >/dev/null; then sha256sum *; else shasum -a 256 *; fi | grep -v checksums.txt > checksums.txt
+
+  image:
+    desc: "Build both images for this machine, as blobfork-azure:local and blobfork-s3:local (CI publishes ghcr.io/stagdhq/blobfork-azure and -s3)"
+    cmds:
+      - docker buildx build --load --build-arg VERSION={{.VERSION}} -f docker/azure/Dockerfile -t blobfork-azure:local .
+      - docker buildx build --load --build-arg VERSION={{.VERSION}} -f docker/s3/Dockerfile -t blobfork-s3:local .

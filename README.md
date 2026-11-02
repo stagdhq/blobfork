@@ -171,6 +171,8 @@ S3:
 go test ./...
 ```
 
+[Task](https://taskfile.dev) is pinned in `go.mod`: `go tool task check` runs what CI does, `go tool task image` builds both images, and `go tool task --list` shows the rest. A `v*` tag releases: the binaries and checksums on its GitHub release, and both images on ghcr.io.
+
 The tests run the Azure SDK and the AWS SDK against blobfork in front of the emulators, which they start with Docker: one Azurite (`mcr.microsoft.com/azure-storage/azurite:3.35.0`) with a second account in it holding the real container, and two Flocis (`floci/floci:2.4.0`), one holding the real bucket. `BLOBFORK_TEST_AZURITE`, `BLOBFORK_TEST_FLOCI` and `BLOBFORK_TEST_FLOCI_LAB` point them at running ones instead.
 
 ## License
