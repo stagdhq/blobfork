@@ -130,20 +130,6 @@ The image runs Floci inside, on 4567 and checking signatures, with blobfork in f
 
 Run outside the image, blobfork needs a Floci that checks signatures (`FLOCI_AUTH_VALIDATE_SIGNATURES=true`) and that only blobfork can reach.
 
-### In a Stagd preview
-
-`stagd.yaml` asks for it, and Stagd fills in your app's settings:
-
-```yaml
-services:
-  azure-blob:
-    from: [staging-files]
-  s3:
-    from: [staging-uploads]
-```
-
-There the real container or bucket is read through Stagd, so its SAS or key never reaches the preview.
-
 The settings above may change before the first release. `blobfork version` prints the version.
 
 ## What it leaves out, for now
