@@ -75,11 +75,12 @@ func startFloci() (string, func(), error) {
 		"-e", "FLOCI_AUTH_VALIDATE_SIGNATURES=true",
 		"-e", "FLOCI_STORAGE_MODE=memory",
 		flociImage,
-	).CombinedOutput()
+	).Output()
 	if err != nil {
-		return "", nil, fmt.Errorf("docker run: %w: %s", err, out)
+		return "", nil, fmt.Errorf("docker run: %w: %s", err, stderr(err))
 	}
 
+	// Only the container's ID is on stdout; a pull's progress isn't.
 	id := strings.TrimSpace(string(out))
 	stop := func() { exec.Command("docker", "rm", "-f", id).Run() }
 
@@ -850,4 +851,13 @@ func dockerPort(id, port string) (string, error) {
 
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+func stderr(err error) []byte {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return exit.Stderr
+	}
+
+	return nil
 }
