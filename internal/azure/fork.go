@@ -15,9 +15,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // Config is what a fork needs: Azurite, its account, and the containers to
@@ -63,6 +66,11 @@ type forked struct {
 	markers *markers
 }
 
+// HealthPath answers 200 when blobfork is up and its emulator answers, for
+// a health check (blobfork <front> health). An account or bucket name can't
+// have a "_", so it's no one's.
+const HealthPath = "/_blobfork/health"
+
 // HiddenContainer holds the delete markers, where the app's listings don't
 // see them. blobfork leaves it out of List Containers.
 const HiddenContainer = "blobfork-deleted"
@@ -86,7 +94,10 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 
 	account := target.String() + "/" + cfg.Account
 
-	hidden, err := container.NewClientWithSharedKeyCredential(account+"/"+HiddenContainer, cred, nil)
+	// The SDK's requests to Azurite are spans too.
+	options := &container.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: telemetry.Client}}
+
+	hidden, err := container.NewClientWithSharedKeyCredential(account+"/"+HiddenContainer, cred, options)
 	if err != nil {
 		return nil, err
 	}
@@ -102,18 +113,18 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 			return nil, fmt.Errorf("%s is blobfork's own container", name)
 		}
 
-		client, err := container.NewClientWithSharedKeyCredential(account+"/"+name, cred, nil)
+		client, err := container.NewClientWithSharedKeyCredential(account+"/"+name, cred, options)
 		if err != nil {
 			return nil, err
 		}
 
 		f.containers[name] = &forked{
 			name:   name,
-			lower:  lower,
+			lower:  timed{Layer: lower, container: name},
 			client: client,
 			upper: &SASLayer{
 				URL:    account + "/" + name,
-				Client: http.DefaultClient,
+				Client: telemetry.Client,
 				SAS: func() string {
 					values := sas.BlobSignatureValues{
 						Protocol:      sas.ProtocolHTTPSandHTTP,
@@ -140,6 +151,7 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 			// Azurite writes the app's host into listings and copy sources.
 			r.Out.Host = r.In.Host
 		},
+		Transport:      telemetry.Transport(http.DefaultTransport),
 		ModifyResponse: f.modify,
 		ErrorHandler:   f.fail,
 	}
@@ -147,6 +159,12 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 	if err := f.start(ctx); err != nil {
 		return nil, err
 	}
+
+	telemetry.ObserveMarkers("azure", func(report func(string, int)) {
+		for name, c := range f.containers {
+			report(name, c.markers.count())
+		}
+	})
 
 	return f, nil
 }
@@ -224,7 +242,26 @@ var writesInPlace = map[string]bool{
 }
 
 func (f *Fork) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == HealthPath {
+		f.health(w, r)
+
+		return
+	}
+
 	rt := f.route(r)
+
+	name := ""
+	if rt.c != nil {
+		name = rt.c.name
+	}
+
+	r = r.WithContext(telemetry.Name(r.Context(), "azure", spanName(r, rt), name))
+	telemetry.Answered(r.Context(), telemetry.AnsweredByFork)
+
+	status := &telemetry.StatusWriter{ResponseWriter: w}
+	w = status
+
+	defer func() { telemetry.Finish(r.Context(), status.Status) }()
 
 	if r.Method == http.MethodPut && rt.name != "" {
 		if err := f.copyUpFor(r, rt); err != nil {
@@ -289,6 +326,43 @@ func (f *Fork) route(r *http.Request) route {
 	}
 
 	return rt
+}
+
+// health answers HealthPath: Azurite answers for the account, with its key.
+func (f *Fork) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if _, err := f.hidden.GetProperties(ctx, nil); err != nil {
+		http.Error(w, "azurite: "+err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
+
+	io.WriteString(w, "ok\n")
+}
+
+// spanName is what blobfork does with a request, for its span.
+func spanName(r *http.Request, rt route) string {
+	switch rt.kind {
+	case routeRead:
+		return "read"
+
+	case routeDelete:
+		return "delete"
+
+	case routeList:
+		return "list"
+
+	case routeListContainers:
+		return "list containers"
+	}
+
+	if r.Method == http.MethodPut && r.Header.Get("X-Ms-Copy-Source") != "" {
+		return "copy"
+	}
+
+	return "pass " + r.Method
 }
 
 // copyUpFor copies a lower blob up before a write that needs it in the fork:
@@ -377,6 +451,9 @@ func (f *Fork) read(res *http.Response, rt route) error {
 
 	res.Body.Close()
 	replace(res, lower)
+
+	telemetry.Answered(req.Context(), telemetry.AnsweredByLower)
+	telemetry.LowerReads.Add(req.Context(), 1, telemetry.Attrs("azure", rt.c.name))
 
 	return nil
 }
@@ -467,6 +544,9 @@ func (f *Fork) list(res *http.Response, rt route) error {
 		version:   req.Header.Get("X-Ms-Version"),
 		max:       max,
 	}
+
+	telemetry.Answered(req.Context(), telemetry.AnsweredByMerge)
+	telemetry.MergedPages.Add(req.Context(), 1, telemetry.Attrs("azure", rt.c.name))
 
 	body, err := m.answer(req.Context(), head, query.Get("marker"), query.Has("maxresults"))
 	if errors.Is(err, errBadMarker) {

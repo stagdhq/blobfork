@@ -26,5 +26,8 @@ COPY docker/licenses/floci.txt /usr/share/licenses/floci/LICENSE
 
 EXPOSE 4566
 
+# Up once blobfork serves and its emulator answers.
+HEALTHCHECK --interval=5s --timeout=5s --start-period=60s --retries=3 CMD ["blobfork", "s3", "health"]
+
 ENTRYPOINT ["blobfork-entrypoint"]
 CMD []

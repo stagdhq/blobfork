@@ -15,6 +15,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // Layer is a bucket blobfork reads from: the real one under the fork (the
@@ -153,7 +155,7 @@ func (b *Bucket) Do(ctx context.Context, method, key string, query url.Values, h
 
 	client := b.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = telemetry.Client
 	}
 
 	return client.Do(req)

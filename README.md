@@ -123,12 +123,47 @@ The image runs Floci inside, on 4567 and checking signatures, with blobfork in f
 | `--secret-access-key` | `BLOBFORK_SECRET_ACCESS_KEY` | `test` | Its secret. |
 | `--region` | `BLOBFORK_REGION` | `us-east-1` | The region the app signs for. |
 | `--listen` | `BLOBFORK_LISTEN` | `:4566` | Where the app reaches blobfork. |
+| `--trust-forwarded-host` | `BLOBFORK_TRUST_FORWARDED_HOST` | off | Check signatures, presigned URLs too, against `X-Forwarded-Host`: for blobfork behind a proxy that passes on a host of its own. Only behind one, as anyone reaching blobfork directly could set it. |
 | `--floci` | `BLOBFORK_FLOCI` | `http://127.0.0.1:4567` | Floci's endpoint. |
 | `--log-level` | `BLOBFORK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
+
+SigV4 signs the host the app sends to, so blobfork has to see that host: directly, or in `X-Forwarded-Host` with `--trust-forwarded-host`. Azure's signatures don't cover the host, so the Azure front needs neither.
 
 `blobfork s3 check` takes the `--from` flags, lists each real bucket and reads an object of it. It can't tell whether the key could also write: that's for the key's policy.
 
 Run outside the image, blobfork needs a Floci that checks signatures (`FLOCI_AUTH_VALIDATE_SIGNATURES=true`) and that only blobfork can reach.
+
+### Health
+
+`blobfork azure health` and `blobfork s3 health` exit 0 once blobfork serves at `--listen` and its emulator answers (Azurite for the account and its key, Floci for its bucket), for a container's health check; both images use them as theirs. In `docker compose`:
+
+```yaml
+    healthcheck:
+      test: ["CMD", "blobfork", "s3", "health"]
+```
+
+Over HTTP it's `GET /_blobfork/health`, answering 200 or 503.
+
+### OpenTelemetry
+
+blobfork sends traces and metrics over OTLP/HTTP when an endpoint is set, with the standard variables: `OTEL_EXPORTER_OTLP_ENDPOINT` (or `_TRACES_ENDPOINT` and `_METRICS_ENDPOINT`), `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` (`blobfork` if not set), `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL`. Without one it sends nothing.
+
+- **A span for each request,** joining the app's trace if it sent one (`traceparent`), named for what blobfork did: `read`, `delete`, `list`, `copy`, `list containers` or `list buckets`, and `pass <method>` for the rest. Its `blobfork.answered_by` says what answered: `fork`, `lower` (the real container or bucket) or `merge` (a listing of both), with `blobfork.front` and `blobfork.container` (the container or bucket). The requests to the emulator and to the real one are spans under it.
+- **Metrics,** each by `blobfork.front` and `blobfork.container` (the container or bucket), for a dashboard of a fork:
+
+| Metric | | |
+|---|---|---|
+| `blobfork.requests` | counter | Requests served, also by `blobfork.operation` (`read`, `delete`, `list`, `copy`, `pass`, …), `blobfork.answered_by` and `blobfork.outcome` (`ok`, `client_error`, `server_error`). |
+| `blobfork.request.duration` | histogram, s | How long blobfork took to answer, with the same attributes. |
+| `blobfork.lower.reads` | counter | Reads answered from the real one. |
+| `blobfork.lower.bytes` | counter, bytes | Bytes read from the real one, for the app or a copy-up: what the fork costs it in egress. |
+| `blobfork.lower.duration` | histogram, s | How long the real one took to answer, by `blobfork.operation` (`read`, `head`, `list`). |
+| `blobfork.copy_ups`, `blobfork.copy_ups.bytes` | counters | Files, and their bytes, copied from the real one into the fork. |
+| `blobfork.deletes.hidden` | counter | Delete markers written. |
+| `blobfork.deletes.markers` | gauge | Files of the real one the fork hides now. |
+| `blobfork.listings.merged` | counter | Listing pages merged from both layers. |
+
+  OpenTelemetry's own HTTP metrics come too (`http.server.request.duration`, `http.client.request.duration`). Health checks (`/_blobfork/…`) are left out of all of it.
 
 The settings above may change before the first release. `blobfork version` prints the version.
 

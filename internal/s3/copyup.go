@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // copyHeaders are the object's headers a copy-up keeps, besides its metadata
@@ -85,6 +87,8 @@ func (f *Fork) copyUp(ctx context.Context, b *forked, key string) error {
 	switch {
 	case put.StatusCode == http.StatusOK:
 		f.Log.Debug("blobfork: copied up", "bucket", b.name, "key", key)
+		telemetry.CopyUps.Add(ctx, 1, telemetry.Attrs("s3", b.name))
+		telemetry.CopyUpBytes.Add(ctx, max(res.ContentLength, 0), telemetry.Attrs("s3", b.name))
 
 		return nil
 

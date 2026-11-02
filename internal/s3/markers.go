@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // markers are the lower objects the app has deleted: an empty object each in
@@ -98,6 +100,8 @@ func (m *markers) add(ctx context.Context, key string) error {
 	m.mu.Lock()
 	m.names[key] = struct{}{}
 	m.mu.Unlock()
+
+	telemetry.Hidden.Add(ctx, 1, telemetry.Attrs("s3", strings.TrimSuffix(m.prefix, "/")))
 
 	return nil
 }

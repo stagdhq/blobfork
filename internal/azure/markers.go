@@ -7,6 +7,8 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // markers are the lower blobs the app has deleted: an empty blob each in the
@@ -86,6 +88,8 @@ func (m *markers) add(ctx context.Context, name string) error {
 	m.mu.Lock()
 	m.names[name] = struct{}{}
 	m.mu.Unlock()
+
+	telemetry.Hidden.Add(ctx, 1, telemetry.Attrs("azure", strings.TrimSuffix(m.prefix, "/")))
 
 	return nil
 }

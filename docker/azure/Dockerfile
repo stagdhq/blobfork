@@ -26,4 +26,7 @@ COPY LICENSE /usr/share/licenses/blobfork/LICENSE
 VOLUME /data
 EXPOSE 10000
 
+# Up once blobfork serves and its emulator answers.
+HEALTHCHECK --interval=5s --timeout=5s --start-period=60s --retries=3 CMD ["blobfork", "azure", "health"]
+
 ENTRYPOINT ["blobfork-entrypoint"]

@@ -5,13 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // New returns the root command.
@@ -48,11 +53,30 @@ func logger(cmd *cli.Command) (*slog.Logger, error) {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})), nil
 }
 
-// serve serves a fork until ctx ends.
-func serve(ctx context.Context, addr string, handler http.Handler, log *slog.Logger) error {
+// serve serves a fork until ctx ends, with OpenTelemetry on if an OTLP
+// endpoint is set.
+func serve(ctx context.Context, version, addr string, handler http.Handler, log *slog.Logger) error {
+	stop, err := telemetry.Setup(ctx, version)
+	if err != nil {
+		return fmt.Errorf("opentelemetry: %w", err)
+	}
+
+	defer func() {
+		flush, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := stop(flush); err != nil {
+			log.Warn("blobfork: opentelemetry", "err", err)
+		}
+	}()
+
+	if telemetry.Enabled() {
+		log.Info("blobfork: opentelemetry on")
+	}
+
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           telemetry.Handler(handler),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
@@ -72,6 +96,61 @@ func serve(ctx context.Context, addr string, handler http.Handler, log *slog.Log
 	}
 
 	return nil
+}
+
+// listenFlag is where blobfork serves the app, for serve and health.
+func listenFlag(value string) *cli.StringFlag {
+	return &cli.StringFlag{
+		Name:    "listen",
+		Usage:   "address the app reaches blobfork at",
+		Value:   value,
+		Sources: cli.EnvVars("BLOBFORK_LISTEN"),
+	}
+}
+
+// healthCommand asks the blobfork serving at --listen whether it and its
+// emulator are up, for a container's health check.
+func healthCommand(emulator, listen, path string) *cli.Command {
+	return &cli.Command{
+		Name:  "health",
+		Usage: "exit 0 when blobfork is serving and " + emulator + " answers, for a container's health check",
+		Flags: []cli.Flag{
+			listenFlag(listen),
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			host, port, err := net.SplitHostPort(cmd.String("listen"))
+			if err != nil {
+				return fmt.Errorf("--listen: %w", err)
+			}
+
+			// Listening on every address, blobfork answers on loopback.
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = "127.0.0.1"
+			}
+
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+net.JoinHostPort(host, port)+path, nil)
+			if err != nil {
+				return err
+			}
+
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("not serving: %w", err)
+			}
+			defer res.Body.Close()
+
+			body, _ := io.ReadAll(io.LimitReader(res.Body, 4<<10))
+
+			if res.StatusCode != http.StatusOK {
+				return fmt.Errorf("not ready: %s", strings.TrimSpace(string(body)))
+			}
+
+			return nil
+		},
+	}
 }
 
 func versionCommand(version string) *cli.Command {

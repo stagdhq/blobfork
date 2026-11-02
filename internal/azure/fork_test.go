@@ -826,3 +826,19 @@ func stderr(err error) []byte {
 
 	return nil
 }
+
+// The health path answers 200 without a key once the emulator answers.
+func TestHealth(t *testing.T) {
+	e := setup(t)
+
+	res, err := http.Get(e.proxy.URL + HealthPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("health: %d", res.StatusCode)
+	}
+}

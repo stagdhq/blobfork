@@ -26,6 +26,7 @@ func azureCommand(version string) *cli.Command {
 		Commands: []*cli.Command{
 			azureServeCommand(version),
 			azureCheckCommand(),
+			healthCommand("Azurite", ":10000", azure.HealthPath),
 		},
 	}
 }
@@ -75,12 +76,7 @@ func azureServeCommand(version string) *cli.Command {
 		DisableSliceFlagSeparator: true,
 		Flags: []cli.Flag{
 			azureFromFlag(),
-			&cli.StringFlag{
-				Name:    "listen",
-				Usage:   "address the app reaches blobfork at",
-				Value:   ":10000",
-				Sources: cli.EnvVars("BLOBFORK_LISTEN"),
-			},
+			listenFlag(":10000"),
 			&cli.StringFlag{
 				Name:    "azurite",
 				Usage:   "Azurite's blob endpoint, without the account",
@@ -138,7 +134,7 @@ func azureServeCommand(version string) *cli.Command {
 
 			log.Info("blobfork: serving", "version", version)
 
-			return serve(ctx, cmd.String("listen"), fork, log)
+			return serve(ctx, version, cmd.String("listen"), fork, log)
 		},
 	}
 }

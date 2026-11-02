@@ -22,6 +22,7 @@ func s3Command(version string) *cli.Command {
 		Commands: []*cli.Command{
 			s3ServeCommand(version),
 			s3CheckCommand(),
+			healthCommand("Floci", ":4566", s3.HealthPath),
 		},
 	}
 }
@@ -133,11 +134,11 @@ func s3ServeCommand(version string) *cli.Command {
 			"from it copy the object up first. The real buckets are never written.",
 		DisableSliceFlagSeparator: true,
 		Flags: append(s3FromFlags(),
-			&cli.StringFlag{
-				Name:    "listen",
-				Usage:   "address the app reaches blobfork at",
-				Value:   ":4566",
-				Sources: cli.EnvVars("BLOBFORK_LISTEN"),
+			listenFlag(":4566"),
+			&cli.BoolFlag{
+				Name:    "trust-forwarded-host",
+				Usage:   "check signatures against X-Forwarded-Host, behind a proxy that sets it and passes on a host of its own; only behind one, as anyone reaching blobfork directly could set it",
+				Sources: cli.EnvVars("BLOBFORK_TRUST_FORWARDED_HOST"),
 			},
 			&cli.StringFlag{
 				Name:    "floci",
@@ -190,9 +191,10 @@ func s3ServeCommand(version string) *cli.Command {
 					AccessKeyID:     cmd.String("access-key-id"),
 					SecretAccessKey: cmd.String("secret-access-key"),
 				},
-				Region:  cmd.String("region"),
-				Buckets: buckets,
-				Log:     log,
+				Region:             cmd.String("region"),
+				TrustForwardedHost: cmd.Bool("trust-forwarded-host"),
+				Buckets:            buckets,
+				Log:                log,
 			})
 			if err != nil {
 				return err
@@ -200,7 +202,7 @@ func s3ServeCommand(version string) *cli.Command {
 
 			log.Info("blobfork: serving", "version", version)
 
-			return serve(ctx, cmd.String("listen"), fork, log)
+			return serve(ctx, version, cmd.String("listen"), fork, log)
 		},
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // Layer is a container blobfork reads from: the real one under the fork (the
@@ -106,7 +108,7 @@ func NewSASLayer(raw string) (*SASLayer, error) {
 	return &SASLayer{
 		URL:    strings.TrimRight(u.String(), "/"),
 		SAS:    func() string { return sas },
-		Client: http.DefaultClient,
+		Client: telemetry.Client,
 	}, nil
 }
 

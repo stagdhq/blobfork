@@ -12,6 +12,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // copyUp copies a lower blob into the fork, unless the fork has it or a
@@ -89,6 +91,8 @@ func (f *Fork) copyUp(ctx context.Context, c *forked, name string) error {
 	}
 
 	f.Log.Debug("blobfork: copied up", "container", c.name, "blob", name)
+	telemetry.CopyUps.Add(ctx, 1, telemetry.Attrs("azure", c.name))
+	telemetry.CopyUpBytes.Add(ctx, max(res.ContentLength, 0), telemetry.Attrs("azure", c.name))
 
 	return nil
 }

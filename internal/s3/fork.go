@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+
+	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
 // Config is what a fork needs: Floci, the credentials the app signs with,
@@ -30,6 +32,12 @@ type Config struct {
 	// Credentials and Region are what the app signs with, and blobfork too.
 	Credentials aws.Credentials
 	Region      string
+
+	// TrustForwardedHost takes the host the app signed for from
+	// X-Forwarded-Host, for blobfork behind a proxy that sets it and passes
+	// on a host of its own. Only behind one: anyone reaching blobfork
+	// directly could set it.
+	TrustForwardedHost bool
 
 	// Buckets are the forked buckets by their names in Floci, usually the
 	// real ones', each with the real bucket under it.
@@ -56,6 +64,11 @@ type forked struct {
 	upper   *Bucket
 	markers *markers
 }
+
+// HealthPath answers 200 when blobfork is up and its emulator answers, for
+// a health check (blobfork <front> health). An account or bucket name can't
+// have a "_", so it's no one's.
+const HealthPath = "/_blobfork/health"
 
 // HiddenBucket holds the delete markers, where the app's listings don't see
 // them. blobfork leaves it out of ListBuckets.
@@ -94,16 +107,18 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 			return nil, fmt.Errorf("%s is blobfork's own bucket", name)
 		}
 
-		f.buckets[name] = &forked{name: name, lower: lower, upper: bucket(name)}
+		f.buckets[name] = &forked{name: name, lower: timed{Layer: lower, bucket: name}, upper: bucket(name)}
 	}
 
 	f.proxy = &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 
-			// SigV4 signs the host: Floci checks the app's.
+			// SigV4 signs the host: Floci checks the app's. Rewrite drops
+			// the X-Forwarded headers on the way.
 			r.Out.Host = r.In.Host
 		},
+		Transport:      telemetry.Transport(http.DefaultTransport),
 		ModifyResponse: f.modify,
 		ErrorHandler:   f.fail,
 	}
@@ -111,6 +126,12 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 	if err := f.start(ctx); err != nil {
 		return nil, err
 	}
+
+	telemetry.ObserveMarkers("s3", func(report func(string, int)) {
+		for name, b := range f.buckets {
+			report(name, b.markers.count())
+		}
+	})
 
 	return f, nil
 }
@@ -212,6 +233,20 @@ var listQueryV1 = map[string]bool{"prefix": true, "delimiter": true, "marker": t
 var writesInPlace = []string{"tagging", "acl", "retention", "legal-hold"}
 
 func (f *Fork) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == HealthPath {
+		f.health(w, r)
+
+		return
+	}
+
+	// SigV4 signs the host the app sent to. Behind a proxy that passes on a
+	// host of its own, that's X-Forwarded-Host; the first, if several
+	// proxies added one. Floci then checks against it, presigned URLs too.
+	if forwarded := r.Header.Get("X-Forwarded-Host"); f.TrustForwardedHost && forwarded != "" {
+		host, _, _ := strings.Cut(forwarded, ",")
+		r.Host = strings.TrimSpace(host)
+	}
+
 	// Floci takes unsigned requests; blobfork doesn't, as a request Floci
 	// answers is one the app may read through. A browser's preflight and a
 	// form upload (which signs its policy) pass.
@@ -222,6 +257,19 @@ func (f *Fork) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rt := f.route(r)
+
+	name := ""
+	if rt.b != nil {
+		name = rt.b.name
+	}
+
+	r = r.WithContext(telemetry.Name(r.Context(), "s3", spanName(r, rt), name))
+	telemetry.Answered(r.Context(), telemetry.AnsweredByFork)
+
+	status := &telemetry.StatusWriter{ResponseWriter: w}
+	w = status
+
+	defer func() { telemetry.Finish(r.Context(), status.Status) }()
 
 	if rt.kind == routeDeleteMany {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
@@ -328,6 +376,52 @@ func onlyQuery(query url.Values, allowed func(string) bool) bool {
 	}
 
 	return true
+}
+
+// health answers HealthPath: Floci answers for the hidden bucket.
+func (f *Fork) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	res, err := f.hidden.Do(ctx, http.MethodHead, "", nil, nil, nil, 0)
+	if err != nil {
+		http.Error(w, "floci: "+err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
+
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		http.Error(w, "floci: "+res.Status, http.StatusServiceUnavailable)
+
+		return
+	}
+
+	io.WriteString(w, "ok\n")
+}
+
+// spanName is what blobfork does with a request, for its span.
+func spanName(r *http.Request, rt route) string {
+	switch rt.kind {
+	case routeRead:
+		return "read"
+
+	case routeDelete, routeDeleteMany:
+		return "delete"
+
+	case routeList:
+		return "list"
+
+	case routeListBuckets:
+		return "list buckets"
+	}
+
+	if r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "" {
+		return "copy"
+	}
+
+	return "pass " + r.Method
 }
 
 // copyUpFor copies a lower object up before a write that needs it in the
@@ -443,6 +537,9 @@ func (f *Fork) read(res *http.Response, rt route) error {
 
 	res.Body.Close()
 	replace(res, lower)
+
+	telemetry.Answered(req.Context(), telemetry.AnsweredByLower)
+	telemetry.LowerReads.Add(req.Context(), 1, telemetry.Attrs("s3", rt.b.name))
 
 	return nil
 }
@@ -562,6 +659,9 @@ func (f *Fork) list(res *http.Response, rt route) error {
 		attributes: req.Header.Get("X-Amz-Optional-Object-Attributes"),
 		max:        max,
 	}
+
+	telemetry.Answered(req.Context(), telemetry.AnsweredByMerge)
+	telemetry.MergedPages.Add(req.Context(), 1, telemetry.Attrs("s3", rt.b.name))
 
 	body, err := m.answer(req.Context(), query)
 	if errors.Is(err, errBadToken) {
