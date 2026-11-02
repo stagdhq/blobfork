@@ -18,7 +18,7 @@ azurite-blob \
   --silent &
 azurite=$!
 
-blobfork serve "$@" &
+blobfork azure serve "$@" &
 blobfork=$!
 
 trap 'kill $azurite $blobfork 2>/dev/null' INT TERM
