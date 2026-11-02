@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,12 +17,12 @@ import (
 // account the app uses: the fork is the app's own, nothing in it is secret.
 const AzuriteKey = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 
-// azureCommand is the Azure front: a fork of a container, in front of
+// azureCommand is the Azure front: forks of containers, in front of
 // Azurite.
 func azureCommand(version string) *cli.Command {
 	return &cli.Command{
 		Name:  "azure",
-		Usage: "fork an Azure Blob Storage container, in front of Azurite",
+		Usage: "fork Azure Blob Storage containers, in front of Azurite",
 		Commands: []*cli.Command{
 			azureServeCommand(version),
 			azureCheckCommand(),
@@ -29,14 +30,39 @@ func azureCommand(version string) *cli.Command {
 	}
 }
 
-// azureFromFlag is the real container, for serve and check.
-func azureFromFlag() *cli.StringFlag {
-	return &cli.StringFlag{
-		Name:     "from",
-		Usage:    "the real container's URL, with a SAS that can read and list (https://<account>.blob.core.windows.net/<container>?sv=…&sp=rl&sig=…)",
-		Sources:  cli.EnvVars("BLOBFORK_FROM"),
-		Required: true,
+// azureFromFlag is the real containers, for serve and check.
+func azureFromFlag() cli.Flag {
+	return fromFlag("a real container's URL, with a SAS that can read and list (https://<account>.blob.core.windows.net/<container>?sv=…&sp=rl&sig=…)")
+}
+
+// azureLowers are the real containers by the names of their forks.
+func azureLowers(cmd *cli.Command) (map[string]*azure.SASLayer, error) {
+	list, err := froms(cmd)
+	if err != nil {
+		return nil, err
 	}
+
+	lowers := map[string]*azure.SASLayer{}
+
+	for _, f := range list {
+		lower, err := azure.NewSASLayer(f.raw)
+		if err != nil {
+			return nil, fmt.Errorf("--from: %w", err)
+		}
+
+		name := f.name
+		if name == "" {
+			name = lower.Container()
+		}
+
+		if _, ok := lowers[name]; ok {
+			return nil, fmt.Errorf("--from: %s twice", name)
+		}
+
+		lowers[name] = lower
+	}
+
+	return lowers, nil
 }
 
 func azureServeCommand(version string) *cli.Command {
@@ -45,7 +71,8 @@ func azureServeCommand(version string) *cli.Command {
 		Usage: "serve the fork: the app's blob endpoint, in front of Azurite",
 		Description: "Requests pass through to Azurite. Reads the fork can't answer come from the real\n" +
 			"container, deletes of its blobs leave a marker, listings merge both, and copies\n" +
-			"from it copy the blob up first. The real container is never written.",
+			"from it copy the blob up first. The real containers are never written.",
+		DisableSliceFlagSeparator: true,
 		Flags: []cli.Flag{
 			azureFromFlag(),
 			&cli.StringFlag{
@@ -72,12 +99,6 @@ func azureServeCommand(version string) *cli.Command {
 				Sources:     cli.EnvVars("BLOBFORK_KEY"),
 				DefaultText: "Azurite's",
 			},
-			&cli.StringFlag{
-				Name:        "container",
-				Usage:       "the forked container's name, if not the real one's",
-				Sources:     cli.EnvVars("BLOBFORK_CONTAINER"),
-				DefaultText: "the real one's",
-			},
 			logFlag(),
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -86,9 +107,9 @@ func azureServeCommand(version string) *cli.Command {
 				return err
 			}
 
-			lower, err := azure.NewSASLayer(cmd.String("from"))
+			lowers, err := azureLowers(cmd)
 			if err != nil {
-				return fmt.Errorf("--from: %w", err)
+				return err
 			}
 
 			key := cmd.String("key")
@@ -96,24 +117,26 @@ func azureServeCommand(version string) *cli.Command {
 				key = AzuriteKey
 			}
 
-			name := cmd.String("container")
-			if name == "" {
-				name = lower.Container()
+			containers := map[string]azure.Layer{}
+
+			for name, lower := range lowers {
+				containers[name] = lower
+
+				log.Info("blobfork: forking", "container", name, "from", lower.URL)
 			}
 
 			fork, err := azure.New(ctx, azure.Config{
-				Azurite:   cmd.String("azurite"),
-				Account:   cmd.String("account"),
-				Key:       key,
-				Container: name,
-				Lower:     lower,
-				Log:       log,
+				Azurite:    cmd.String("azurite"),
+				Account:    cmd.String("account"),
+				Key:        key,
+				Containers: containers,
+				Log:        log,
 			})
 			if err != nil {
 				return err
 			}
 
-			log.Info("blobfork: serving", "version", version, "from", lower.URL, "container", name)
+			log.Info("blobfork: serving", "version", version)
 
 			return serve(ctx, cmd.String("listen"), fork, log)
 		},
@@ -126,61 +149,79 @@ const writePermissions = "acwdxytmei"
 
 func azureCheckCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "check",
-		Usage: "check that the real container can be listed and read, and that the SAS can't write",
+		Name:                      "check",
+		Usage:                     "check that the real containers can be listed and read, and that their SAS can't write",
+		DisableSliceFlagSeparator: true,
 		Flags: []cli.Flag{
 			azureFromFlag(),
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			out := cmd.Root().Writer
 
-			lower, err := azure.NewSASLayer(cmd.String("from"))
+			list, err := froms(cmd)
 			if err != nil {
-				return fmt.Errorf("--from: %w", err)
+				return err
 			}
 
-			raw, _ := url.Parse(cmd.String("from"))
-
-			if perms := raw.Query().Get("sp"); strings.ContainsAny(perms, writePermissions) {
-				fmt.Fprintf(out, "warning: the SAS may change the container (sp=%s); blobfork only needs r and l\n", perms)
+			for _, f := range list {
+				if err := azureCheck(ctx, out, f.raw); err != nil {
+					return err
+				}
 			}
-
-			if expiry := raw.Query().Get("se"); expiry != "" {
-				fmt.Fprintf(out, "SAS expires %s\n", expiry)
-			}
-
-			page, err := lower.List(ctx, azure.ListQuery{MaxResults: 10})
-			if err != nil {
-				return fmt.Errorf("listing %s: %w", lower.URL, err)
-			}
-
-			more := ""
-			if page.NextMarker != "" {
-				more = ", more after"
-			}
-
-			fmt.Fprintf(out, "listed %s: %d blobs on the first page%s\n", lower.URL, len(page.Entries), more)
-
-			if len(page.Entries) == 0 {
-				return nil
-			}
-
-			name := page.Entries[0].Name
-
-			res, err := lower.Blob(ctx, http.MethodHead, name, "", http.Header{})
-			if err != nil {
-				return fmt.Errorf("reading %s: %w", name, err)
-			}
-
-			res.Body.Close()
-
-			if res.StatusCode != http.StatusOK {
-				return fmt.Errorf("reading %s: %s", name, res.Status)
-			}
-
-			fmt.Fprintf(out, "read %s: %s bytes\n", name, res.Header.Get("Content-Length"))
 
 			return nil
 		},
 	}
+}
+
+// azureCheck lists a real container, reads a blob of it, and says whether
+// its SAS could write.
+func azureCheck(ctx context.Context, out io.Writer, from string) error {
+	lower, err := azure.NewSASLayer(from)
+	if err != nil {
+		return fmt.Errorf("--from: %w", err)
+	}
+
+	raw, _ := url.Parse(from)
+
+	if perms := raw.Query().Get("sp"); strings.ContainsAny(perms, writePermissions) {
+		fmt.Fprintf(out, "warning: the SAS for %s may change the container (sp=%s); blobfork only needs r and l\n", lower.URL, perms)
+	}
+
+	if expiry := raw.Query().Get("se"); expiry != "" {
+		fmt.Fprintf(out, "SAS for %s expires %s\n", lower.URL, expiry)
+	}
+
+	page, err := lower.List(ctx, azure.ListQuery{MaxResults: 10})
+	if err != nil {
+		return fmt.Errorf("listing %s: %w", lower.URL, err)
+	}
+
+	more := ""
+	if page.NextMarker != "" {
+		more = ", more after"
+	}
+
+	fmt.Fprintf(out, "listed %s: %d blobs on the first page%s\n", lower.URL, len(page.Entries), more)
+
+	if len(page.Entries) == 0 {
+		return nil
+	}
+
+	name := page.Entries[0].Name
+
+	res, err := lower.Blob(ctx, http.MethodHead, name, "", http.Header{})
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", name, err)
+	}
+
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("reading %s: %s", name, res.Status)
+	}
+
+	fmt.Fprintf(out, "read %s: %s bytes\n", name, res.Header.Get("Content-Length"))
+
+	return nil
 }

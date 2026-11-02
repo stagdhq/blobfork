@@ -25,12 +25,12 @@ var copyHeaders = []string{
 //
 // It doesn't overwrite (If-None-Match: *): a write the app made meanwhile
 // wins.
-func (f *Fork) copyUp(ctx context.Context, key string) error {
-	if f.markers.has(key) {
+func (f *Fork) copyUp(ctx context.Context, b *forked, key string) error {
+	if b.markers.has(key) {
 		return nil
 	}
 
-	head, err := f.upper.Do(ctx, http.MethodHead, key, nil, nil, nil, 0)
+	head, err := b.upper.Do(ctx, http.MethodHead, key, nil, nil, nil, 0)
 	if err != nil {
 		return fmt.Errorf("copy up %s: %w", key, err)
 	}
@@ -45,7 +45,7 @@ func (f *Fork) copyUp(ctx context.Context, key string) error {
 		return fmt.Errorf("copy up %s: fork: %s", key, head.Status)
 	}
 
-	res, err := f.Lower.Object(ctx, http.MethodGet, key, nil, http.Header{})
+	res, err := b.lower.Object(ctx, http.MethodGet, key, nil, http.Header{})
 	if err != nil {
 		return fmt.Errorf("copy up %s: %w", key, err)
 	}
@@ -74,7 +74,7 @@ func (f *Fork) copyUp(ctx context.Context, key string) error {
 		}
 	}
 
-	put, err := f.upper.Do(ctx, http.MethodPut, key, nil, header, res.Body, res.ContentLength)
+	put, err := b.upper.Do(ctx, http.MethodPut, key, nil, header, res.Body, res.ContentLength)
 	if err != nil {
 		return fmt.Errorf("copy up %s: %w", key, err)
 	}
@@ -84,7 +84,7 @@ func (f *Fork) copyUp(ctx context.Context, key string) error {
 
 	switch {
 	case put.StatusCode == http.StatusOK:
-		f.Log.Debug("blobfork: copied up", "key", key)
+		f.Log.Debug("blobfork: copied up", "bucket", b.name, "key", key)
 
 		return nil
 

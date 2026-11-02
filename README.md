@@ -47,21 +47,23 @@ docker build -f docker/s3/Dockerfile -t blobfork-s3 .
 
 ### Azure
 
-On its own, beside your app, with a read-only SAS for the container to fork:
+On its own, beside your app, with a read-only SAS for each container to fork:
 
 ```yaml
 services:
   blobs:
     image: ghcr.io/stagdhq/blobfork-azure
     environment:
-      BLOBFORK_FROM: https://acmestaging.blob.core.windows.net/files?sv=…&sp=rl&sig=…
+      BLOBFORK_FROM: >-
+        https://acmestaging.blob.core.windows.net/files?sv=…&sp=rl&sig=…
+        https://acmestaging.blob.core.windows.net/images?sv=…&sp=rl&sig=…
   app:
     build: .
     environment:
       AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=blobfork;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://blobs:10000/blobfork
 ```
 
-The container in the fork keeps the real one's name, so your app's settings work unchanged. The account key is Azurite's well-known one unless you set `BLOBFORK_KEY`: the fork holds only what the app writes, and the real container's SAS never leaves blobfork. In `docker compose`, write each `$` in the SAS as `$$`.
+Each container in the fork keeps the real one's name, so your app's settings work unchanged; `<name>=<url>` forks one under another name. They share the one account, so the app's one connection string reaches them all. The account key is Azurite's well-known one unless you set `BLOBFORK_KEY`: the fork holds only what the app writes, and the real containers' SAS never leave blobfork. In `docker compose`, write each `$` in the SAS as `$$`.
 
 The image runs Azurite inside, on 10010, with blobfork in front of it on 10000; Azurite keeps its data in `/data`.
 
@@ -69,28 +71,27 @@ The image runs Azurite inside, on 10010, with blobfork in front of it on 10000; 
 
 | Flag | Variable | Default | |
 |---|---|---|---|
-| `--from` | `BLOBFORK_FROM` | | The real container's URL with a SAS that can read and list (`sp=rl`). Required. |
+| `--from` | `BLOBFORK_FROM` | | A real container's URL with a SAS that can read and list (`sp=rl`), or `<name>=<url>` to fork it under another name. Required; the flag again for each container, or several in the variable, apart by spaces or lines. |
 | `--account` | `BLOBFORK_ACCOUNT` | `blobfork` | The account the app uses, `AccountName` in its connection string. |
 | `--key` | `BLOBFORK_KEY` | Azurite's well-known key | Its key, `AccountKey`. |
-| `--container` | `BLOBFORK_CONTAINER` | the real one's name | The forked container's name. |
 | `--listen` | `BLOBFORK_LISTEN` | `:10000` | Where the app reaches blobfork. |
 | `--azurite` | `BLOBFORK_AZURITE` | `http://127.0.0.1:10010` | Azurite's blob endpoint, without the account. |
 | `--log-level` | `BLOBFORK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
 
-`blobfork azure check --from <url>` lists the real container and reads a blob of it, and warns if the SAS could write.
+`blobfork azure check --from <url>` lists each real container and reads a blob of it, and warns if a SAS could write.
 
 Run outside the image, blobfork needs an Azurite started with the account (`AZURITE_ACCOUNTS=blobfork:<key>`), `--skipApiVersionCheck` (blobfork passes the app's API version on) and `--disableProductStyleUrl` (so a host like `blob--pr-1.example.com` isn't read as an account).
 
 ### S3
 
-On its own, beside your app, with a key that can only read and list the bucket to fork (`s3:GetObject`, `s3:ListBucket`):
+On its own, beside your app, with a key that can only read and list the buckets to fork (`s3:GetObject`, `s3:ListBucket`):
 
 ```yaml
 services:
   blobs:
     image: ghcr.io/stagdhq/blobfork-s3
     environment:
-      BLOBFORK_FROM: s3://acme-staging-uploads
+      BLOBFORK_FROM: s3://acme-staging-uploads s3://acme-staging-exports
       BLOBFORK_FROM_REGION: eu-north-1
       BLOBFORK_FROM_ACCESS_KEY_ID: AKIA…
       BLOBFORK_FROM_SECRET_ACCESS_KEY: …
@@ -103,7 +104,7 @@ services:
       AWS_REGION: us-east-1
 ```
 
-The bucket in the fork keeps the real one's name. The app signs with Floci's keys, `test` and `test`, and addresses the bucket in the path (`forcePathStyle: true`, `UsePathStyle`, `s3ForcePathStyle` or the like in its SDK): blobfork answers at one host, not one per bucket. The real bucket's key never leaves blobfork.
+Each bucket in the fork keeps the real one's name; `<name>=s3://<bucket>` forks one under another name. The real buckets are all read at the one endpoint, with the one key. The app signs with Floci's keys, `test` and `test`, and addresses the bucket in the path (`forcePathStyle: true`, `UsePathStyle`, `s3ForcePathStyle` or the like in its SDK): blobfork answers at one host, not one per bucket. The real buckets' key never leaves blobfork.
 
 The image runs Floci inside, on 4567 and checking signatures, with blobfork in front of it on 4566. Floci keeps its data in memory unless you set `FLOCI_STORAGE_MODE` (`persistent` keeps it in `/app/data`).
 
@@ -111,14 +112,13 @@ The image runs Floci inside, on 4567 and checking signatures, with blobfork in f
 
 | Flag | Variable | Default | |
 |---|---|---|---|
-| `--from` | `BLOBFORK_FROM` | | The real bucket, `s3://<bucket>`. Required. |
-| `--from-endpoint` | `BLOBFORK_FROM_ENDPOINT` | AWS's | Its S3 endpoint, for R2, MinIO and the like. |
-| `--from-region` | `BLOBFORK_FROM_REGION` | `us-east-1` | Its region. |
-| `--from-path-style` | `BLOBFORK_FROM_PATH_STYLE` | with `--from-endpoint` | Address it in the path, not the host. |
-| `--from-access-key-id` | `BLOBFORK_FROM_ACCESS_KEY_ID` | | A key that can read and list it, and nothing more. Required. |
+| `--from` | `BLOBFORK_FROM` | | A real bucket, `s3://<bucket>`, or `<name>=s3://<bucket>` to fork it under another name. Required; the flag again for each bucket, or several in the variable, apart by spaces or lines. |
+| `--from-endpoint` | `BLOBFORK_FROM_ENDPOINT` | AWS's | Their S3 endpoint, for R2, MinIO and the like. |
+| `--from-region` | `BLOBFORK_FROM_REGION` | `us-east-1` | Their region. |
+| `--from-path-style` | `BLOBFORK_FROM_PATH_STYLE` | with `--from-endpoint` | Address them in the path, not the host. |
+| `--from-access-key-id` | `BLOBFORK_FROM_ACCESS_KEY_ID` | | A key that can read and list them, and nothing more. Required. |
 | `--from-secret-access-key` | `BLOBFORK_FROM_SECRET_ACCESS_KEY` | | Its secret. Required. |
 | `--from-session-token` | `BLOBFORK_FROM_SESSION_TOKEN` | | Its session token, for temporary credentials. |
-| `--bucket` | `BLOBFORK_BUCKET` | the real one's name | The forked bucket's name. |
 | `--access-key-id` | `BLOBFORK_ACCESS_KEY_ID` | `test` | The key the app signs with, Floci's. |
 | `--secret-access-key` | `BLOBFORK_SECRET_ACCESS_KEY` | `test` | Its secret. |
 | `--region` | `BLOBFORK_REGION` | `us-east-1` | The region the app signs for. |
@@ -126,7 +126,7 @@ The image runs Floci inside, on 4567 and checking signatures, with blobfork in f
 | `--floci` | `BLOBFORK_FLOCI` | `http://127.0.0.1:4567` | Floci's endpoint. |
 | `--log-level` | `BLOBFORK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
 
-`blobfork s3 check` takes the `--from` flags, lists the real bucket and reads an object of it. It can't tell whether the key could also write: that's for the key's policy.
+`blobfork s3 check` takes the `--from` flags, lists each real bucket and reads an object of it. It can't tell whether the key could also write: that's for the key's policy.
 
 Run outside the image, blobfork needs a Floci that checks signatures (`FLOCI_AUTH_VALIDATE_SIGNATURES=true`) and that only blobfork can reach.
 
@@ -158,6 +158,7 @@ S3:
 - **GetObjectTagging, GetObjectAcl and GetObjectAttributes** of an object only in the real bucket answer 404.
 - **Copy-ups keep** the object's body, content headers and metadata, not its tags, storage class or encryption settings, and are one PUT: an object over 5 GB isn't copied up.
 - **Conditions on a delete** of an object only in the real bucket aren't checked.
+- **Real buckets in different places:** they're all read at one endpoint, in one region, with one key.
 
 ## Later
 

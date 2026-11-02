@@ -20,7 +20,7 @@ import (
 )
 
 // Config is what a fork needs: Floci, the credentials the app signs with,
-// and the bucket to fork with the layer under it.
+// and the buckets to fork with the layers under them.
 type Config struct {
 	// Floci is Floci's endpoint, e.g. http://127.0.0.1:4567. It must check
 	// signatures (FLOCI_AUTH_VALIDATE_SIGNATURES=true): a request Floci
@@ -31,31 +31,37 @@ type Config struct {
 	Credentials aws.Credentials
 	Region      string
 
-	// Bucket is the forked bucket's name in Floci, usually the real one's.
-	Bucket string
-
-	// Lower is the real bucket.
-	Lower Layer
+	// Buckets are the forked buckets by their names in Floci, usually the
+	// real ones', each with the real bucket under it.
+	Buckets map[string]Layer
 
 	Log *slog.Logger
 }
 
-// Fork is the proxy: requests pass through to Floci, and those on the forked
+// Fork is the proxy: requests pass through to Floci, and those on a forked
 // bucket that the fork can't answer alone are answered with the lower layer.
 type Fork struct {
 	Config
 
-	upper   *Bucket
+	buckets map[string]*forked
 	hidden  *Bucket
-	markers *markers
 	proxy   *httputil.ReverseProxy
+}
+
+// forked is one bucket blobfork forks: the fork's, in Floci, and the real one
+// under it.
+type forked struct {
+	name    string
+	lower   Layer
+	upper   *Bucket
+	markers *markers
 }
 
 // HiddenBucket holds the delete markers, where the app's listings don't see
 // them. blobfork leaves it out of ListBuckets.
 const HiddenBucket = "blobfork-deleted"
 
-// New makes a fork: it waits for Floci, makes the forked bucket and the
+// New makes a fork: it waits for Floci, makes the forked buckets and the
 // hidden one if they aren't there, and reads the delete markers.
 func New(ctx context.Context, cfg Config) (*Fork, error) {
 	target, err := url.Parse(strings.TrimRight(cfg.Floci, "/"))
@@ -73,10 +79,22 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 		}
 	}
 
+	if len(cfg.Buckets) == 0 {
+		return nil, errors.New("no bucket to fork")
+	}
+
 	f := &Fork{
-		Config: cfg,
-		upper:  bucket(cfg.Bucket),
-		hidden: bucket(HiddenBucket),
+		Config:  cfg,
+		buckets: map[string]*forked{},
+		hidden:  bucket(HiddenBucket),
+	}
+
+	for name, lower := range cfg.Buckets {
+		if name == HiddenBucket {
+			return nil, fmt.Errorf("%s is blobfork's own bucket", name)
+		}
+
+		f.buckets[name] = &forked{name: name, lower: lower, upper: bucket(name)}
 	}
 
 	f.proxy = &httputil.ReverseProxy{
@@ -97,13 +115,13 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 	return f, nil
 }
 
-// start makes both buckets, waiting for Floci to come up, and reads the
+// start makes the buckets, waiting for Floci to come up, and reads the
 // markers.
 func (f *Fork) start(ctx context.Context) error {
 	deadline := time.Now().Add(time.Minute)
 
 	for {
-		err := f.upper.create(ctx)
+		err := f.hidden.create(ctx)
 		if err == nil {
 			break
 		}
@@ -120,18 +138,20 @@ func (f *Fork) start(ctx context.Context) error {
 		}
 	}
 
-	if err := f.hidden.create(ctx); err != nil {
-		return fmt.Errorf("hidden bucket: %w", err)
+	for name, b := range f.buckets {
+		if err := b.upper.create(ctx); err != nil {
+			return err
+		}
+
+		var err error
+
+		b.markers, err = loadMarkers(ctx, f.hidden, name)
+		if err != nil {
+			return fmt.Errorf("delete markers of %s: %w", name, err)
+		}
+
+		f.Log.Info("blobfork: ready", "bucket", name, "deleted", b.markers.count())
 	}
-
-	var err error
-
-	f.markers, err = loadMarkers(ctx, f.hidden, f.Bucket)
-	if err != nil {
-		return fmt.Errorf("delete markers: %w", err)
-	}
-
-	f.Log.Info("blobfork: ready", "bucket", f.Bucket, "deleted", f.markers.count())
 
 	return nil
 }
@@ -166,6 +186,7 @@ const (
 
 type route struct {
 	kind int
+	b    *forked
 	key  string
 
 	// v1 is a ListObjects of the first version (marker, not start-after).
@@ -251,7 +272,7 @@ func formUpload(r *http.Request) bool {
 	return r.Method == http.MethodPost && strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data")
 }
 
-// route says what a request is, for the forked bucket (path style); anything
+// route says what a request is, for a forked bucket (path style); anything
 // else passes.
 func (f *Fork) route(r *http.Request) route {
 	query := r.URL.Query()
@@ -265,26 +286,28 @@ func (f *Fork) route(r *http.Request) route {
 	}
 
 	bucket, key, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
-	if bucket != f.Bucket {
+
+	b, ok := f.buckets[bucket]
+	if !ok {
 		return route{}
 	}
 
 	if key == "" {
 		switch {
 		case r.Method == http.MethodGet && query.Get("list-type") == "2":
-			return route{kind: routeList}
+			return route{kind: routeList, b: b}
 
 		case r.Method == http.MethodGet && onlyQuery(query, func(k string) bool { return listQueryV1[k] || readQuery(k) }):
-			return route{kind: routeList, v1: true}
+			return route{kind: routeList, b: b, v1: true}
 
 		case r.Method == http.MethodPost && query.Has("delete"):
-			return route{kind: routeDeleteMany}
+			return route{kind: routeDeleteMany, b: b}
 		}
 
 		return route{}
 	}
 
-	rt := route{key: key}
+	rt := route{b: b, key: key}
 
 	switch {
 	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && onlyQuery(query, readQuery):
@@ -311,42 +334,44 @@ func onlyQuery(query url.Values, allowed func(string) bool) bool {
 // fork: the source of a copy, or the object a write changes in place.
 func (f *Fork) copyUpFor(r *http.Request, rt route) error {
 	if source := r.Header.Get("X-Amz-Copy-Source"); source != "" {
-		key, ok := f.sourceKey(source)
+		b, key, ok := f.sourceKey(source)
 		if !ok {
 			return nil
 		}
 
-		return f.copyUp(r.Context(), key)
+		return f.copyUp(r.Context(), b, key)
 	}
 
 	query := r.URL.Query()
 
 	for _, sub := range writesInPlace {
 		if query.Has(sub) {
-			return f.copyUp(r.Context(), rt.key)
+			return f.copyUp(r.Context(), rt.b, rt.key)
 		}
 	}
 
 	return nil
 }
 
-// sourceKey is the object x-amz-copy-source names, if it's in the forked
+// sourceKey is the object x-amz-copy-source names, if it's in a forked
 // bucket and not a version of it: "/<bucket>/<key>" or "<bucket>/<key>",
 // URL-encoded.
-func (f *Fork) sourceKey(source string) (string, bool) {
+func (f *Fork) sourceKey(source string) (*forked, string, bool) {
 	path, version, _ := strings.Cut(source, "?")
 	if version != "" {
-		return "", false
+		return nil, "", false
 	}
 
 	decoded, err := url.PathUnescape(path)
 	if err != nil {
-		return "", false
+		return nil, "", false
 	}
 
 	bucket, key, _ := strings.Cut(strings.TrimPrefix(decoded, "/"), "/")
 
-	return key, bucket == f.Bucket && key != ""
+	b, ok := f.buckets[bucket]
+
+	return b, key, ok && key != ""
 }
 
 // modify steps in on Floci's answer, where the lower layer has a say.
@@ -380,7 +405,7 @@ func (f *Fork) modify(res *http.Response) error {
 // hides it. Floci checks the signature first, so a 404 means the app may
 // read.
 func (f *Fork) read(res *http.Response, rt route) error {
-	if res.StatusCode != http.StatusNotFound || f.markers.has(rt.key) {
+	if res.StatusCode != http.StatusNotFound || rt.b.markers.has(rt.key) {
 		return nil
 	}
 
@@ -411,7 +436,7 @@ func (f *Fork) read(res *http.Response, rt route) error {
 		}
 	}
 
-	lower, err := f.Lower.Object(req.Context(), req.Method, rt.key, query, req.Header)
+	lower, err := rt.b.lower.Object(req.Context(), req.Method, rt.key, query, req.Header)
 	if err != nil {
 		return err
 	}
@@ -429,7 +454,7 @@ func (f *Fork) delete(res *http.Response, rt route) error {
 		return nil
 	}
 
-	return f.hide(res.Request.Context(), rt.key)
+	return rt.b.hide(res.Request.Context(), rt.key)
 }
 
 // deleteMany leaves markers for the keys of a DeleteObjects that Floci
@@ -479,7 +504,7 @@ func (f *Fork) deleteMany(res *http.Response, rt route) error {
 			slots <- struct{}{}
 			defer func() { <-slots }()
 
-			if err := f.hide(ctx, key); err != nil {
+			if err := rt.b.hide(ctx, key); err != nil {
 				mu.Lock()
 				first = cmpOr(first, err)
 				mu.Unlock()
@@ -493,17 +518,17 @@ func (f *Fork) deleteMany(res *http.Response, rt route) error {
 }
 
 // hide leaves a marker for a key the lower layer has.
-func (f *Fork) hide(ctx context.Context, key string) error {
-	if f.markers.has(key) {
+func (b *forked) hide(ctx context.Context, key string) error {
+	if b.markers.has(key) {
 		return nil
 	}
 
-	below, err := f.inLower(ctx, key)
+	below, err := b.inLower(ctx, key)
 	if err != nil || !below {
 		return err
 	}
 
-	return f.markers.add(ctx, key)
+	return b.markers.add(ctx, key)
 }
 
 // list answers ListObjects with both layers merged, once Floci has said the
@@ -528,9 +553,8 @@ func (f *Fork) list(res *http.Response, rt route) error {
 	}
 
 	m := &merge{
-		fork:       f,
+		b:          rt.b,
 		v1:         rt.v1,
-		bucket:     f.Bucket,
 		prefix:     query.Get("prefix"),
 		delimiter:  query.Get("delimiter"),
 		encoding:   query.Get("encoding-type"),
@@ -587,8 +611,8 @@ func (f *Fork) listBuckets(res *http.Response) error {
 }
 
 // inLower says whether the lower layer has an object.
-func (f *Fork) inLower(ctx context.Context, key string) (bool, error) {
-	res, err := f.Lower.Object(ctx, http.MethodHead, key, nil, http.Header{})
+func (b *forked) inLower(ctx context.Context, key string) (bool, error) {
+	res, err := b.lower.Object(ctx, http.MethodHead, key, nil, http.Header{})
 	if err != nil {
 		return false, err
 	}

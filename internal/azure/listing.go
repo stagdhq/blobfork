@@ -25,7 +25,7 @@ import (
 // its marker and skips the names up to that one: in order, with no repeats or
 // gaps, though the layers' pages don't line up.
 type merge struct {
-	fork *Fork
+	c *forked
 
 	prefix    string
 	delimiter string
@@ -114,8 +114,8 @@ func (m *merge) answer(ctx context.Context, head *enumeration, marker string, ha
 		}
 	}
 
-	upper := m.cursor(m.fork.upper, state.Upper, state.After, false)
-	lower := m.cursor(m.fork.Lower, state.Lower, state.After, true)
+	upper := m.cursor(m.c.upper, state.Upper, state.After, false)
+	lower := m.cursor(m.c.lower, state.Lower, state.After, true)
 
 	var out []Entry
 
@@ -230,17 +230,17 @@ func element(b *bytes.Buffer, name, value string) {
 // a prefix unless every blob under it is deleted.
 func (m *merge) visible(ctx context.Context, entry *Entry) (bool, error) {
 	if !entry.Prefix {
-		return !m.fork.markers.has(entry.Name), nil
+		return !m.c.markers.has(entry.Name), nil
 	}
 
-	if !m.fork.markers.under(entry.Name) {
+	if !m.c.markers.under(entry.Name) {
 		return true, nil
 	}
 
 	marker := ""
 
 	for {
-		page, err := m.fork.Lower.List(ctx, ListQuery{
+		page, err := m.c.lower.List(ctx, ListQuery{
 			Prefix:     entry.Name,
 			MaxResults: 1000,
 			Marker:     marker,
@@ -251,7 +251,7 @@ func (m *merge) visible(ctx context.Context, entry *Entry) (bool, error) {
 		}
 
 		for _, blob := range page.Entries {
-			if !m.fork.markers.has(blob.Name) {
+			if !m.c.markers.has(blob.Name) {
 				return true, nil
 			}
 		}

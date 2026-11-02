@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,11 +14,11 @@ import (
 	"github.com/stagdhq/blobfork/internal/s3"
 )
 
-// s3Command is the S3 front: a fork of a bucket, in front of Floci.
+// s3Command is the S3 front: forks of buckets, in front of Floci.
 func s3Command(version string) *cli.Command {
 	return &cli.Command{
 		Name:  "s3",
-		Usage: "fork an S3 bucket (AWS, R2, MinIO, …), in front of Floci",
+		Usage: "fork S3 buckets (AWS, R2, MinIO, …), in front of Floci",
 		Commands: []*cli.Command{
 			s3ServeCommand(version),
 			s3CheckCommand(),
@@ -25,36 +26,32 @@ func s3Command(version string) *cli.Command {
 	}
 }
 
-// s3FromFlags are the real bucket and how to reach it, for serve and check.
+// s3FromFlags are the real buckets and how to reach them, for serve and
+// check: all at the one endpoint, read with the one key.
 func s3FromFlags() []cli.Flag {
 	return []cli.Flag{
-		&cli.StringFlag{
-			Name:     "from",
-			Usage:    "the real bucket, s3://<bucket>",
-			Sources:  cli.EnvVars("BLOBFORK_FROM"),
-			Required: true,
-		},
+		fromFlag("a real bucket, s3://<bucket>"),
 		&cli.StringFlag{
 			Name:        "from-endpoint",
-			Usage:       "the real bucket's S3 endpoint, for R2, MinIO and the like",
+			Usage:       "the real buckets' S3 endpoint, for R2, MinIO and the like",
 			Sources:     cli.EnvVars("BLOBFORK_FROM_ENDPOINT"),
 			DefaultText: "AWS's, https://s3.<region>.amazonaws.com",
 		},
 		&cli.StringFlag{
 			Name:    "from-region",
-			Usage:   "the real bucket's region",
+			Usage:   "the real buckets' region",
 			Value:   "us-east-1",
 			Sources: cli.EnvVars("BLOBFORK_FROM_REGION"),
 		},
 		&cli.BoolFlag{
 			Name:        "from-path-style",
-			Usage:       "address the real bucket in the path, not the host",
+			Usage:       "address the real buckets in the path, not the host",
 			Sources:     cli.EnvVars("BLOBFORK_FROM_PATH_STYLE"),
 			DefaultText: "with --from-endpoint",
 		},
 		&cli.StringFlag{
 			Name:     "from-access-key-id",
-			Usage:    "an access key that can read and list the real bucket, and nothing more",
+			Usage:    "an access key that can read and list the real buckets, and nothing more",
 			Sources:  cli.EnvVars("BLOBFORK_FROM_ACCESS_KEY_ID"),
 			Required: true,
 		},
@@ -72,11 +69,12 @@ func s3FromFlags() []cli.Flag {
 	}
 }
 
-// s3Lower is the real bucket, from the flags.
-func s3Lower(cmd *cli.Command) (*s3.Bucket, error) {
-	from, err := url.Parse(cmd.String("from"))
-	if err != nil || from.Scheme != "s3" || from.Host == "" || strings.Trim(from.Path, "/") != "" {
-		return nil, fmt.Errorf("--from: not a bucket, s3://<bucket>: %s", cmd.String("from"))
+// s3Lowers are the real buckets by the names of their forks, from the
+// flags.
+func s3Lowers(cmd *cli.Command) (map[string]*s3.Bucket, error) {
+	list, err := froms(cmd)
+	if err != nil {
+		return nil, err
 	}
 
 	region := cmd.String("from-region")
@@ -90,17 +88,39 @@ func s3Lower(cmd *cli.Command) (*s3.Bucket, error) {
 		pathStyle = true
 	}
 
-	return &s3.Bucket{
-		Endpoint:  endpoint,
-		Name:      from.Host,
-		Region:    region,
-		PathStyle: pathStyle,
-		Credentials: aws.Credentials{
-			AccessKeyID:     cmd.String("from-access-key-id"),
-			SecretAccessKey: cmd.String("from-secret-access-key"),
-			SessionToken:    cmd.String("from-session-token"),
-		},
-	}, nil
+	credentials := aws.Credentials{
+		AccessKeyID:     cmd.String("from-access-key-id"),
+		SecretAccessKey: cmd.String("from-secret-access-key"),
+		SessionToken:    cmd.String("from-session-token"),
+	}
+
+	lowers := map[string]*s3.Bucket{}
+
+	for _, f := range list {
+		u, err := url.Parse(f.raw)
+		if err != nil || u.Scheme != "s3" || u.Host == "" || strings.Trim(u.Path, "/") != "" {
+			return nil, fmt.Errorf("--from: not a bucket, s3://<bucket>: %s", f.raw)
+		}
+
+		name := f.name
+		if name == "" {
+			name = u.Host
+		}
+
+		if _, ok := lowers[name]; ok {
+			return nil, fmt.Errorf("--from: %s twice", name)
+		}
+
+		lowers[name] = &s3.Bucket{
+			Endpoint:    endpoint,
+			Name:        u.Host,
+			Region:      region,
+			PathStyle:   pathStyle,
+			Credentials: credentials,
+		}
+	}
+
+	return lowers, nil
 }
 
 func s3ServeCommand(version string) *cli.Command {
@@ -110,7 +130,8 @@ func s3ServeCommand(version string) *cli.Command {
 		Description: "Requests pass through to Floci, which must check signatures\n" +
 			"(FLOCI_AUTH_VALIDATE_SIGNATURES=true). Reads the fork can't answer come from the\n" +
 			"real bucket, deletes of its objects leave a marker, listings merge both, and copies\n" +
-			"from it copy the object up first. The real bucket is never written.",
+			"from it copy the object up first. The real buckets are never written.",
+		DisableSliceFlagSeparator: true,
 		Flags: append(s3FromFlags(),
 			&cli.StringFlag{
 				Name:    "listen",
@@ -142,12 +163,6 @@ func s3ServeCommand(version string) *cli.Command {
 				Value:   "us-east-1",
 				Sources: cli.EnvVars("BLOBFORK_REGION"),
 			},
-			&cli.StringFlag{
-				Name:        "bucket",
-				Usage:       "the forked bucket's name, if not the real one's",
-				Sources:     cli.EnvVars("BLOBFORK_BUCKET"),
-				DefaultText: "the real one's",
-			},
 			logFlag(),
 		),
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -156,14 +171,17 @@ func s3ServeCommand(version string) *cli.Command {
 				return err
 			}
 
-			lower, err := s3Lower(cmd)
+			lowers, err := s3Lowers(cmd)
 			if err != nil {
 				return err
 			}
 
-			name := cmd.String("bucket")
-			if name == "" {
-				name = lower.Name
+			buckets := map[string]s3.Layer{}
+
+			for name, lower := range lowers {
+				buckets[name] = lower
+
+				log.Info("blobfork: forking", "bucket", name, "from", "s3://"+lower.Name, "endpoint", lower.Endpoint)
 			}
 
 			fork, err := s3.New(ctx, s3.Config{
@@ -172,16 +190,15 @@ func s3ServeCommand(version string) *cli.Command {
 					AccessKeyID:     cmd.String("access-key-id"),
 					SecretAccessKey: cmd.String("secret-access-key"),
 				},
-				Region: cmd.String("region"),
-				Bucket: name,
-				Lower:  lower,
-				Log:    log,
+				Region:  cmd.String("region"),
+				Buckets: buckets,
+				Log:     log,
 			})
 			if err != nil {
 				return err
 			}
 
-			log.Info("blobfork: serving", "version", version, "from", "s3://"+lower.Name, "endpoint", lower.Endpoint, "bucket", name)
+			log.Info("blobfork: serving", "version", version)
 
 			return serve(ctx, cmd.String("listen"), fork, log)
 		},
@@ -190,50 +207,63 @@ func s3ServeCommand(version string) *cli.Command {
 
 func s3CheckCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "check",
-		Usage: "check that the real bucket can be listed and read",
-		Flags: s3FromFlags(),
+		Name:                      "check",
+		Usage:                     "check that the real buckets can be listed and read",
+		DisableSliceFlagSeparator: true,
+		Flags:                     s3FromFlags(),
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			out := cmd.Root().Writer
 
-			lower, err := s3Lower(cmd)
+			lowers, err := s3Lowers(cmd)
 			if err != nil {
 				return err
 			}
 
-			page, err := lower.List(ctx, s3.ListQuery{MaxKeys: 10})
-			if err != nil {
-				return fmt.Errorf("listing s3://%s: %w", lower.Name, err)
+			for _, lower := range lowers {
+				if err := s3Check(ctx, out, lower); err != nil {
+					return err
+				}
 			}
 
-			more := ""
-			if page.Next != "" {
-				more = ", more after"
-			}
-
-			fmt.Fprintf(out, "listed s3://%s at %s: %d objects on the first page%s\n", lower.Name, lower.Endpoint, len(page.Entries), more)
-
-			if len(page.Entries) == 0 {
-				return nil
-			}
-
-			key := page.Entries[0].Name
-
-			res, err := lower.Object(ctx, http.MethodHead, key, nil, http.Header{})
-			if err != nil {
-				return fmt.Errorf("reading %s: %w", key, err)
-			}
-
-			res.Body.Close()
-
-			if res.StatusCode != http.StatusOK {
-				return fmt.Errorf("reading %s: %s", key, res.Status)
-			}
-
-			fmt.Fprintf(out, "read %s: %s bytes\n", key, res.Header.Get("Content-Length"))
 			fmt.Fprintln(out, "blobfork can't tell whether the key could also write: give it one that can only read and list (s3:GetObject, s3:ListBucket).")
 
 			return nil
 		},
 	}
+}
+
+// s3Check lists a real bucket and reads an object of it.
+func s3Check(ctx context.Context, out io.Writer, lower *s3.Bucket) error {
+	page, err := lower.List(ctx, s3.ListQuery{MaxKeys: 10})
+	if err != nil {
+		return fmt.Errorf("listing s3://%s: %w", lower.Name, err)
+	}
+
+	more := ""
+	if page.Next != "" {
+		more = ", more after"
+	}
+
+	fmt.Fprintf(out, "listed s3://%s at %s: %d objects on the first page%s\n", lower.Name, lower.Endpoint, len(page.Entries), more)
+
+	if len(page.Entries) == 0 {
+		return nil
+	}
+
+	key := page.Entries[0].Name
+
+	res, err := lower.Object(ctx, http.MethodHead, key, nil, http.Header{})
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", key, err)
+	}
+
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("reading %s: %s", key, res.Status)
+	}
+
+	fmt.Fprintf(out, "read s3://%s/%s: %s bytes\n", lower.Name, key, res.Header.Get("Content-Length"))
+
+	return nil
 }

@@ -18,12 +18,12 @@ import (
 // marker hides it: its body, content headers and metadata. Block blobs only.
 //
 // It doesn't overwrite: a write the app made meanwhile wins.
-func (f *Fork) copyUp(ctx context.Context, name string) error {
-	if f.markers.has(name) {
+func (f *Fork) copyUp(ctx context.Context, c *forked, name string) error {
+	if c.markers.has(name) {
 		return nil
 	}
 
-	client := f.fork.NewBlockBlobClient(name)
+	client := c.client.NewBlockBlobClient(name)
 
 	_, err := client.GetProperties(ctx, nil)
 	if err == nil {
@@ -34,7 +34,7 @@ func (f *Fork) copyUp(ctx context.Context, name string) error {
 		return fmt.Errorf("copy up %s: %w", name, err)
 	}
 
-	res, err := f.Lower.Blob(ctx, http.MethodGet, name, "", http.Header{})
+	res, err := c.lower.Blob(ctx, http.MethodGet, name, "", http.Header{})
 	if err != nil {
 		return fmt.Errorf("copy up %s: %w", name, err)
 	}
@@ -88,7 +88,7 @@ func (f *Fork) copyUp(ctx context.Context, name string) error {
 		return fmt.Errorf("copy up %s: %w", name, err)
 	}
 
-	f.Log.Debug("blobfork: copied up", "blob", name)
+	f.Log.Debug("blobfork: copied up", "container", c.name, "blob", name)
 
 	return nil
 }

@@ -65,7 +65,7 @@ func TestMain(m *testing.M) {
 
 func startAzurite() (func(), error) {
 	out, err := exec.Command(
-		"docker", "run", "-d", "--rm",
+		"docker", "run", "-d",
 		"-p", "127.0.0.1::10000",
 		"-e", "AZURITE_ACCOUNTS=blobfork:"+forkKey+";lab:"+labKey,
 		azuriteImage,
@@ -78,14 +78,14 @@ func startAzurite() (func(), error) {
 	id := strings.TrimSpace(string(out))
 	stop := func() { exec.Command("docker", "rm", "-f", id).Run() }
 
-	port, err := exec.Command("docker", "port", id, "10000/tcp").Output()
+	address, err := dockerPort(id, "10000/tcp")
 	if err != nil {
 		stop()
 
-		return nil, fmt.Errorf("docker port: %w", err)
+		return nil, err
 	}
 
-	azurite = "http://" + strings.TrimSpace(strings.Split(string(port), "\n")[0])
+	azurite = "http://" + address
 
 	return stop, nil
 }
@@ -102,44 +102,58 @@ type env struct {
 }
 
 func setup(t *testing.T) *env {
+	return setupMany(t, 1)[0]
+}
+
+// setupMany forks n containers through one blobfork, an env each.
+func setupMany(t *testing.T, n int) []*env {
 	t.Helper()
 
 	ctx := t.Context()
-	name := fmt.Sprintf("files-%d-%d", time.Now().UnixNano()%1e6, sequence.Add(1))
 
 	labCred, _ := container.NewSharedKeyCredential("lab", labKey)
+	forkCred, _ := container.NewSharedKeyCredential("blobfork", forkKey)
 
-	lab, err := container.NewClientWithSharedKeyCredential(azurite+"/lab/"+name, labCred, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	containers := map[string]Layer{}
+	envs := make([]*env, n)
 
-	if _, err := lab.Create(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
+	for i := range envs {
+		name := fmt.Sprintf("files-%d-%d", time.Now().UnixNano()%1e6, sequence.Add(1))
 
-	query, err := sas.BlobSignatureValues{
-		Protocol:      sas.ProtocolHTTPSandHTTP,
-		ExpiryTime:    time.Now().Add(time.Hour).UTC(),
-		Permissions:   (&sas.ContainerPermissions{Read: true, List: true}).String(),
-		ContainerName: name,
-	}.SignWithSharedKey(labCred)
-	if err != nil {
-		t.Fatal(err)
-	}
+		lab, err := container.NewClientWithSharedKeyCredential(azurite+"/lab/"+name, labCred, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	lower, err := NewSASLayer(azurite + "/lab/" + name + "?" + query.Encode())
-	if err != nil {
-		t.Fatal(err)
+		if _, err := lab.Create(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		query, err := sas.BlobSignatureValues{
+			Protocol:      sas.ProtocolHTTPSandHTTP,
+			ExpiryTime:    time.Now().Add(time.Hour).UTC(),
+			Permissions:   (&sas.ContainerPermissions{Read: true, List: true}).String(),
+			ContainerName: name,
+		}.SignWithSharedKey(labCred)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		lower, err := NewSASLayer(azurite + "/lab/" + name + "?" + query.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		containers[lower.Container()] = lower
+		envs[i] = &env{name: name, lab: lab, labs: lower}
 	}
 
 	fork, err := New(ctx, Config{
-		Azurite:   azurite,
-		Account:   "blobfork",
-		Key:       forkKey,
-		Container: lower.Container(),
-		Lower:     lower,
-		Log:       slog.New(slog.DiscardHandler),
+		Azurite:    azurite,
+		Account:    "blobfork",
+		Key:        forkKey,
+		Containers: containers,
+		Log:        slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -148,14 +162,16 @@ func setup(t *testing.T) *env {
 	proxy := httptest.NewServer(fork)
 	t.Cleanup(proxy.Close)
 
-	forkCred, _ := container.NewSharedKeyCredential("blobfork", forkKey)
+	for _, e := range envs {
+		app, err := container.NewClientWithSharedKeyCredential(proxy.URL+"/blobfork/"+e.name, forkCred, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	app, err := container.NewClientWithSharedKeyCredential(proxy.URL+"/blobfork/"+name, forkCred, nil)
-	if err != nil {
-		t.Fatal(err)
+		e.fork, e.proxy, e.app = fork, proxy, app
 	}
 
-	return &env{name: name, fork: fork, proxy: proxy, app: app, lab: lab, labs: lower}
+	return envs
 }
 
 // seed writes the real container's blobs, then has the test check that it's
@@ -388,7 +404,7 @@ func TestDeletesHide(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !again.markers.has("both.txt") {
+	if !again.containers[e.name].markers.has("both.txt") {
 		t.Fatal("the marker wasn't kept")
 	}
 
@@ -436,7 +452,7 @@ func TestCopyFromLower(t *testing.T) {
 	}
 
 	// The source was copied up, so it's the fork's now, with lab's metadata.
-	props, err := e.fork.fork.NewBlobClient("template.docx").GetProperties(ctx, nil)
+	props, err := e.fork.containers[e.name].client.NewBlobClient("template.docx").GetProperties(ctx, nil)
 	if err != nil {
 		t.Fatalf("not copied up: %v", err)
 	}
@@ -457,7 +473,7 @@ func TestCopyFromLower(t *testing.T) {
 		t.Fatalf("Put Block From URL: %v", err)
 	}
 
-	if _, err := e.fork.fork.NewBlobClient("part.bin").GetProperties(ctx, nil); err != nil {
+	if _, err := e.fork.containers[e.name].client.NewBlobClient("part.bin").GetProperties(ctx, nil); err != nil {
 		t.Fatalf("Put Block From URL's source not copied up: %v", err)
 	}
 }
@@ -485,6 +501,65 @@ func TestWriteInPlace(t *testing.T) {
 
 	if body, _ := e.read(t, "a.txt"); body != "lab's" {
 		t.Fatalf("body after copy-up: %q", body)
+	}
+}
+
+// Several containers fork through one blobfork, each over its own real one,
+// and a copy from one to another copies its source up in its own.
+func TestSeveralContainers(t *testing.T) {
+	envs := setupMany(t, 2)
+	files, images := envs[0], envs[1]
+
+	files.seed(t, map[string]string{"a.txt": "files'", "shared.txt": "in files"})
+	images.seed(t, map[string]string{"logo.png": "images'", "shared.txt": "in images"})
+
+	ctx := t.Context()
+
+	for _, check := range []struct {
+		e          *env
+		name, body string
+	}{
+		{files, "a.txt", "files'"},
+		{files, "shared.txt", "in files"},
+		{images, "logo.png", "images'"},
+		{images, "shared.txt", "in images"},
+	} {
+		if body, err := check.e.read(t, check.name); err != nil || body != check.body {
+			t.Fatalf("%s in %s: %q %v", check.name, check.e.name, body, err)
+		}
+	}
+
+	if _, err := files.read(t, "logo.png"); !bloberror.HasCode(err, bloberror.BlobNotFound) {
+		t.Fatalf("another container's blob: %v", err)
+	}
+
+	if _, err := files.app.NewBlobClient("shared.txt").Delete(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if body, _ := images.read(t, "shared.txt"); body != "in images" {
+		t.Fatalf("a delete in one container hid another's: %q", body)
+	}
+
+	if blobs := listFlat(t, files.app, 0); !slices.Equal(blobs, []string{"a.txt"}) {
+		t.Fatalf("files: %v", blobs)
+	}
+
+	if blobs := listFlat(t, images.app, 0); !slices.Equal(blobs, []string{"logo.png", "shared.txt"}) {
+		t.Fatalf("images: %v", blobs)
+	}
+
+	_, err := files.app.NewBlobClient("logo-copy.png").StartCopyFromURL(ctx, images.app.NewBlobClient("logo.png").URL(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if body, err := files.read(t, "logo-copy.png"); err != nil || body != "images'" {
+		t.Fatalf("copy across containers: %q %v", body, err)
+	}
+
+	if _, err := images.fork.containers[images.name].client.NewBlobClient("logo.png").GetProperties(ctx, nil); err != nil {
+		t.Fatalf("the source wasn't copied up in its own container: %v", err)
 	}
 }
 
@@ -717,4 +792,26 @@ func hierarchy(names []string, prefix string) (blobs, prefixes []string) {
 	}
 
 	return blobs, prefixes
+}
+
+// dockerPort is the address a container's port is published at, waiting a
+// little for it; a container that stopped instead says why, in its logs.
+func dockerPort(id, port string) (string, error) {
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		out, err := exec.Command("docker", "port", id, port).Output()
+		if err == nil {
+			return strings.TrimSpace(strings.Split(string(out), "\n")[0]), nil
+		}
+
+		if time.Now().After(deadline) {
+			state, _ := exec.Command("docker", "inspect", "-f", "{{.State.Status}} (exit {{.State.ExitCode}})", id).CombinedOutput()
+			logs, _ := exec.Command("docker", "logs", "--tail", "40", id).CombinedOutput()
+
+			return "", fmt.Errorf("docker port %s: %w; the container is %s; its logs:\n%s", port, err, strings.TrimSpace(string(state)), logs)
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
 }

@@ -20,8 +20,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 )
 
-// Config is what a fork needs: Azurite, its account, and the container to
-// fork with the layer under it.
+// Config is what a fork needs: Azurite, its account, and the containers to
+// fork with the layers under them.
 type Config struct {
 	// Azurite is Azurite's blob endpoint, without the account, e.g.
 	// http://127.0.0.1:10010.
@@ -31,34 +31,43 @@ type Config struct {
 	Account string
 	Key     string
 
-	// Container is the forked container's name in Azurite, usually the real
-	// one's.
-	Container string
-
-	// Lower is the real container.
-	Lower Layer
+	// Containers are the forked containers by their names in Azurite, usually
+	// the real ones', each with the real container under it.
+	Containers map[string]Layer
 
 	Log *slog.Logger
 }
 
-// Fork is the proxy: requests pass through to Azurite, and those on the
-// forked container that the fork can't answer alone are answered with the
-// lower layer.
+// Fork is the proxy: requests pass through to Azurite, and those on a forked
+// container that the fork can't answer alone are answered with the lower
+// layer.
 type Fork struct {
 	Config
 
-	upper   *SASLayer
-	fork    *container.Client
-	hidden  *container.Client
+	containers map[string]*forked
+	hidden     *container.Client
+	proxy      *httputil.ReverseProxy
+}
+
+// forked is one container blobfork forks: the fork's, in Azurite, and the
+// real one under it.
+type forked struct {
+	name  string
+	lower Layer
+
+	// upper is the fork's, listed with a SAS of blobfork's own: the app's
+	// request is signed for the app's marker, not the fork's.
+	upper  *SASLayer
+	client *container.Client
+
 	markers *markers
-	proxy   *httputil.ReverseProxy
 }
 
 // HiddenContainer holds the delete markers, where the app's listings don't
 // see them. blobfork leaves it out of List Containers.
 const HiddenContainer = "blobfork-deleted"
 
-// New makes a fork: it waits for Azurite, makes the forked container and the
+// New makes a fork: it waits for Azurite, makes the forked containers and the
 // hidden one if they aren't there, and reads the delete markers.
 func New(ctx context.Context, cfg Config) (*Fork, error) {
 	target, err := url.Parse(strings.TrimRight(cfg.Azurite, "/"))
@@ -71,12 +80,11 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 		return nil, fmt.Errorf("account key: %w", err)
 	}
 
-	account := target.String() + "/" + cfg.Account
-
-	fork, err := container.NewClientWithSharedKeyCredential(account+"/"+cfg.Container, cred, nil)
-	if err != nil {
-		return nil, err
+	if len(cfg.Containers) == 0 {
+		return nil, errors.New("no container to fork")
 	}
+
+	account := target.String() + "/" + cfg.Account
 
 	hidden, err := container.NewClientWithSharedKeyCredential(account+"/"+HiddenContainer, cred, nil)
 	if err != nil {
@@ -84,31 +92,45 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 	}
 
 	f := &Fork{
-		Config: cfg,
-		fork:   fork,
-		hidden: hidden,
+		Config:     cfg,
+		containers: map[string]*forked{},
+		hidden:     hidden,
 	}
 
-	// blobfork lists the fork with a SAS of its own: the app's request is
-	// signed for the app's marker, not the fork's.
-	f.upper = &SASLayer{
-		URL:    account + "/" + cfg.Container,
-		Client: http.DefaultClient,
-		SAS: func() string {
-			values := sas.BlobSignatureValues{
-				Protocol:      sas.ProtocolHTTPSandHTTP,
-				ExpiryTime:    time.Now().Add(time.Hour).UTC(),
-				Permissions:   (&sas.ContainerPermissions{Read: true, List: true}).String(),
-				ContainerName: cfg.Container,
-			}
+	for name, lower := range cfg.Containers {
+		if name == HiddenContainer {
+			return nil, fmt.Errorf("%s is blobfork's own container", name)
+		}
 
-			query, err := values.SignWithSharedKey(cred)
-			if err != nil {
-				panic(err) // only with no expiry or permissions, both set above
-			}
+		client, err := container.NewClientWithSharedKeyCredential(account+"/"+name, cred, nil)
+		if err != nil {
+			return nil, err
+		}
 
-			return query.Encode()
-		},
+		f.containers[name] = &forked{
+			name:   name,
+			lower:  lower,
+			client: client,
+			upper: &SASLayer{
+				URL:    account + "/" + name,
+				Client: http.DefaultClient,
+				SAS: func() string {
+					values := sas.BlobSignatureValues{
+						Protocol:      sas.ProtocolHTTPSandHTTP,
+						ExpiryTime:    time.Now().Add(time.Hour).UTC(),
+						Permissions:   (&sas.ContainerPermissions{Read: true, List: true}).String(),
+						ContainerName: name,
+					}
+
+					query, err := values.SignWithSharedKey(cred)
+					if err != nil {
+						panic(err) // only with no expiry or permissions, both set above
+					}
+
+					return query.Encode()
+				},
+			},
+		}
 	}
 
 	f.proxy = &httputil.ReverseProxy{
@@ -129,13 +151,13 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 	return f, nil
 }
 
-// start makes both containers, waiting for Azurite to come up, and reads the
+// start makes the containers, waiting for Azurite to come up, and reads the
 // markers.
 func (f *Fork) start(ctx context.Context) error {
 	deadline := time.Now().Add(time.Minute)
 
 	for {
-		_, err := f.fork.Create(ctx, nil)
+		_, err := f.hidden.Create(ctx, nil)
 		if err == nil || bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
 			break
 		}
@@ -152,17 +174,19 @@ func (f *Fork) start(ctx context.Context) error {
 		}
 	}
 
-	_, err := f.hidden.Create(ctx, nil)
-	if err != nil && !bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
-		return fmt.Errorf("hidden container: %w", err)
-	}
+	for name, c := range f.containers {
+		_, err := c.client.Create(ctx, nil)
+		if err != nil && !bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
+			return fmt.Errorf("container %s: %w", name, err)
+		}
 
-	f.markers, err = loadMarkers(ctx, f.hidden, f.Container)
-	if err != nil {
-		return fmt.Errorf("delete markers: %w", err)
-	}
+		c.markers, err = loadMarkers(ctx, f.hidden, name)
+		if err != nil {
+			return fmt.Errorf("delete markers of %s: %w", name, err)
+		}
 
-	f.Log.Info("blobfork: ready", "container", f.Container, "deleted", f.markers.count())
+		f.Log.Info("blobfork: ready", "container", name, "deleted", c.markers.count())
+	}
 
 	return nil
 }
@@ -178,6 +202,7 @@ const (
 
 type route struct {
 	kind int
+	c    *forked
 	name string
 	comp string
 }
@@ -216,7 +241,7 @@ func (f *Fork) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.proxy.ServeHTTP(w, r)
 }
 
-// route says what a request is, for the forked container; anything else
+// route says what a request is, for a forked container; anything else
 // passes.
 func (f *Fork) route(r *http.Request) route {
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 3)
@@ -235,19 +260,20 @@ func (f *Fork) route(r *http.Request) route {
 		return route{}
 	}
 
-	if parts[1] != f.Container {
+	c, ok := f.containers[parts[1]]
+	if !ok {
 		return route{}
 	}
 
 	if len(parts) == 2 || parts[2] == "" {
 		if r.Method == http.MethodGet && comp == "list" && query.Get("restype") == "container" {
-			return route{kind: routeList}
+			return route{kind: routeList, c: c}
 		}
 
 		return route{}
 	}
 
-	rt := route{name: parts[2], comp: comp}
+	rt := route{c: c, name: parts[2], comp: comp}
 
 	// Snapshots and versions are the fork's own.
 	if query.Has("snapshot") || query.Has("versionid") {
@@ -269,43 +295,46 @@ func (f *Fork) route(r *http.Request) route {
 // the source of a copy, or the blob a write changes in place.
 func (f *Fork) copyUpFor(r *http.Request, rt route) error {
 	if source := r.Header.Get("X-Ms-Copy-Source"); source != "" {
-		name, ok := f.sourceName(source)
+		c, name, ok := f.sourceName(source)
 		if !ok {
 			return nil
 		}
 
-		return f.copyUp(r.Context(), name)
+		return f.copyUp(r.Context(), c, name)
 	}
 
 	if writesInPlace[rt.comp] {
-		return f.copyUp(r.Context(), rt.name)
+		return f.copyUp(r.Context(), rt.c, rt.name)
 	}
 
 	return nil
 }
 
-// sourceName is the blob a copy source names, if it's in the forked
-// container: path style (/<account>/<container>/<blob>) as blobfork serves
-// it, or the account's own host (<account>.blob…/<container>/<blob>).
-func (f *Fork) sourceName(source string) (string, bool) {
+// sourceName is the blob a copy source names, if it's in a forked container:
+// path style (/<account>/<container>/<blob>) as blobfork serves it, or the
+// account's own host (<account>.blob…/<container>/<blob>).
+func (f *Fork) sourceName(source string) (*forked, string, bool) {
 	u, err := url.Parse(source)
 	if err != nil {
-		return "", false
+		return nil, "", false
 	}
 
 	parts := strings.SplitN(strings.TrimPrefix(u.Path, "/"), "/", 3)
 
-	if len(parts) == 3 && parts[0] == f.Account && parts[1] == f.Container && parts[2] != "" {
-		return parts[2], true
+	if len(parts) == 3 && parts[0] == f.Account && parts[2] != "" {
+		c, ok := f.containers[parts[1]]
+
+		return c, parts[2], ok
 	}
 
-	if len(parts) >= 2 && strings.HasPrefix(u.Hostname(), f.Account+".") && parts[0] == f.Container {
+	if len(parts) >= 2 && strings.HasPrefix(u.Hostname(), f.Account+".") {
+		c, ok := f.containers[parts[0]]
 		name := strings.Join(parts[1:], "/")
 
-		return name, name != ""
+		return c, name, ok && name != ""
 	}
 
-	return "", false
+	return nil, "", false
 }
 
 // modify steps in on Azurite's answer, where the lower layer has a say.
@@ -323,7 +352,7 @@ func (f *Fork) modify(res *http.Response) error {
 		return f.delete(res, rt)
 
 	case routeList:
-		return f.list(res)
+		return f.list(res, rt)
 
 	case routeListContainers:
 		return f.listContainers(res)
@@ -335,13 +364,13 @@ func (f *Fork) modify(res *http.Response) error {
 // read answers a read the fork can't from the lower layer, unless a marker
 // hides it. Azurite answering 404 rather than 403 means the app may read.
 func (f *Fork) read(res *http.Response, rt route) error {
-	if !blobNotFound(res) || f.markers.has(rt.name) {
+	if !blobNotFound(res) || rt.c.markers.has(rt.name) {
 		return nil
 	}
 
 	req := res.Request
 
-	lower, err := f.Lower.Blob(req.Context(), req.Method, rt.name, rt.comp, req.Header)
+	lower, err := rt.c.lower.Blob(req.Context(), req.Method, rt.name, rt.comp, req.Header)
 	if err != nil {
 		return err
 	}
@@ -359,28 +388,28 @@ func (f *Fork) delete(res *http.Response, rt route) error {
 
 	switch {
 	case res.StatusCode == http.StatusAccepted:
-		if f.markers.has(rt.name) {
+		if rt.c.markers.has(rt.name) {
 			return nil
 		}
 
-		below, err := f.inLower(ctx, rt.name)
+		below, err := rt.c.inLower(ctx, rt.name)
 		if err != nil || !below {
 			return err
 		}
 
-		return f.markers.add(ctx, rt.name)
+		return rt.c.markers.add(ctx, rt.name)
 
 	case blobNotFound(res):
-		if f.markers.has(rt.name) {
+		if rt.c.markers.has(rt.name) {
 			return nil
 		}
 
-		below, err := f.inLower(ctx, rt.name)
+		below, err := rt.c.inLower(ctx, rt.name)
 		if err != nil || !below {
 			return err
 		}
 
-		if err := f.markers.add(ctx, rt.name); err != nil {
+		if err := rt.c.markers.add(ctx, rt.name); err != nil {
 			return err
 		}
 
@@ -402,7 +431,7 @@ func (f *Fork) delete(res *http.Response, rt route) error {
 
 // list answers List Blobs with both layers merged, once Azurite has said the
 // app may list.
-func (f *Fork) list(res *http.Response) error {
+func (f *Fork) list(res *http.Response, rt route) error {
 	if res.StatusCode != http.StatusOK {
 		return nil
 	}
@@ -431,7 +460,7 @@ func (f *Fork) list(res *http.Response) error {
 	}
 
 	m := &merge{
-		fork:      f,
+		c:         rt.c,
 		prefix:    query.Get("prefix"),
 		delimiter: query.Get("delimiter"),
 		include:   query.Get("include"),
@@ -486,8 +515,8 @@ func (f *Fork) listContainers(res *http.Response) error {
 }
 
 // inLower says whether the lower layer has a blob.
-func (f *Fork) inLower(ctx context.Context, name string) (bool, error) {
-	res, err := f.Lower.Blob(ctx, http.MethodHead, name, "", http.Header{})
+func (c *forked) inLower(ctx context.Context, name string) (bool, error) {
+	res, err := c.lower.Blob(ctx, http.MethodHead, name, "", http.Header{})
 	if err != nil {
 		return false, err
 	}

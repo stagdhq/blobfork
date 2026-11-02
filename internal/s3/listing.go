@@ -24,10 +24,9 @@ import (
 // asks each layer to start after it. A V1 listing's marker is that name
 // already.
 type merge struct {
-	fork *Fork
+	b *forked
 
 	v1         bool
-	bucket     string
 	prefix     string
 	delimiter  string
 	encoding   string
@@ -75,8 +74,8 @@ func (m *merge) answer(ctx context.Context, query url.Values) ([]byte, error) {
 		}
 	}
 
-	upper := m.cursor(m.fork.upper, after)
-	lower := m.cursor(m.fork.Lower, after)
+	upper := m.cursor(m.b.upper, after)
+	lower := m.cursor(m.b.lower, after)
 
 	var out []Entry
 
@@ -139,7 +138,7 @@ func (m *merge) answer(ctx context.Context, query url.Values) ([]byte, error) {
 
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
 
-	element(&b, "Name", m.bucket, true)
+	element(&b, "Name", m.b.name, true)
 	element(&b, "Prefix", m.echo(m.prefix), true)
 
 	if m.v1 {
@@ -204,23 +203,23 @@ func element(b *bytes.Buffer, name, value string, always bool) {
 // it, a prefix unless every object under it is deleted.
 func (m *merge) visible(ctx context.Context, entry *Entry) (bool, error) {
 	if !entry.Prefix {
-		return !m.fork.markers.has(entry.Name), nil
+		return !m.b.markers.has(entry.Name), nil
 	}
 
-	if !m.fork.markers.under(entry.Name) {
+	if !m.b.markers.under(entry.Name) {
 		return true, nil
 	}
 
 	token := ""
 
 	for {
-		page, err := m.fork.Lower.List(ctx, ListQuery{Prefix: entry.Name, EncodingType: "url", Token: token})
+		page, err := m.b.lower.List(ctx, ListQuery{Prefix: entry.Name, EncodingType: "url", Token: token})
 		if err != nil {
 			return false, err
 		}
 
 		for _, object := range page.Entries {
-			if !m.fork.markers.has(object.Name) {
+			if !m.b.markers.has(object.Name) {
 				return true, nil
 			}
 		}

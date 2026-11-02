@@ -70,7 +70,7 @@ func TestMain(m *testing.M) {
 
 func startFloci() (string, func(), error) {
 	out, err := exec.Command(
-		"docker", "run", "-d", "--rm",
+		"docker", "run", "-d",
 		"-p", "127.0.0.1::4566",
 		"-e", "FLOCI_AUTH_VALIDATE_SIGNATURES=true",
 		"-e", "FLOCI_STORAGE_MODE=memory",
@@ -83,14 +83,14 @@ func startFloci() (string, func(), error) {
 	id := strings.TrimSpace(string(out))
 	stop := func() { exec.Command("docker", "rm", "-f", id).Run() }
 
-	port, err := exec.Command("docker", "port", id, "4566/tcp").Output()
+	address, err := dockerPort(id, "4566/tcp")
 	if err != nil {
 		stop()
 
-		return "", nil, fmt.Errorf("docker port: %w", err)
+		return "", nil, err
 	}
 
-	return "http://" + strings.TrimSpace(strings.Split(string(port), "\n")[0]), stop, nil
+	return "http://" + address, stop, nil
 }
 
 func client(endpoint string, credentials aws.Credentials) *awss3.Client {
@@ -113,43 +113,55 @@ type env struct {
 }
 
 func setup(t *testing.T) *env {
+	return setupMany(t, 1)[0]
+}
+
+// setupMany forks n buckets through one blobfork, an env each.
+func setupMany(t *testing.T, n int) []*env {
 	t.Helper()
 
 	ctx := t.Context()
-	bucket := fmt.Sprintf("files-%d-%d", time.Now().UnixNano()%1e6, sequence.Add(1))
 
 	lab := client(flociLab, testCredentials)
 
-	// Floci may still be starting.
-	deadline := time.Now().Add(time.Minute)
+	buckets := map[string]Layer{}
+	envs := make([]*env, n)
 
-	for {
-		_, err := lab.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)})
-		if err == nil {
-			break
+	for i := range envs {
+		bucket := fmt.Sprintf("files-%d-%d", time.Now().UnixNano()%1e6, sequence.Add(1))
+
+		// Floci may still be starting.
+		deadline := time.Now().Add(time.Minute)
+
+		for {
+			_, err := lab.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)})
+			if err == nil {
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
+
+			time.Sleep(500 * time.Millisecond)
 		}
 
-		if time.Now().After(deadline) {
-			t.Fatal(err)
+		buckets[bucket] = &Bucket{
+			Endpoint:    flociLab,
+			Name:        bucket,
+			Region:      "us-east-1",
+			PathStyle:   true,
+			Credentials: testCredentials,
 		}
 
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	lower := &Bucket{
-		Endpoint:    flociLab,
-		Name:        bucket,
-		Region:      "us-east-1",
-		PathStyle:   true,
-		Credentials: testCredentials,
+		envs[i] = &env{bucket: bucket, lab: lab}
 	}
 
 	fork, err := New(ctx, Config{
 		Floci:       floci,
 		Credentials: testCredentials,
 		Region:      "us-east-1",
-		Bucket:      bucket,
-		Lower:       lower,
+		Buckets:     buckets,
 		Log:         slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
@@ -159,7 +171,11 @@ func setup(t *testing.T) *env {
 	proxy := httptest.NewServer(fork)
 	t.Cleanup(proxy.Close)
 
-	return &env{bucket: bucket, fork: fork, proxy: proxy, app: client(proxy.URL, testCredentials), lab: lab}
+	for _, e := range envs {
+		e.fork, e.proxy, e.app = fork, proxy, client(proxy.URL, testCredentials)
+	}
+
+	return envs
 }
 
 // seed writes the real bucket's objects, then has the test check that it's
@@ -422,7 +438,7 @@ func TestDeletesHide(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !again.markers.has("both.txt") || !again.markers.has("many/2") {
+	if !again.buckets[e.bucket].markers.has("both.txt") || !again.buckets[e.bucket].markers.has("many/2") {
 		t.Fatal("the markers weren't kept")
 	}
 
@@ -522,6 +538,68 @@ func TestWriteInPlace(t *testing.T) {
 
 	if body, _ := e.read(t, "a.txt"); body != "lab's" {
 		t.Fatalf("body after copy-up: %q", body)
+	}
+}
+
+// Several buckets fork through one blobfork, each over its own real one, and
+// a copy from one to another copies its source up in its own.
+func TestSeveralBuckets(t *testing.T) {
+	envs := setupMany(t, 2)
+	files, images := envs[0], envs[1]
+
+	files.seed(t, map[string]string{"a.txt": "files'", "shared.txt": "in files"})
+	images.seed(t, map[string]string{"logo.png": "images'", "shared.txt": "in images"})
+
+	ctx := t.Context()
+
+	for _, check := range []struct {
+		e         *env
+		key, body string
+	}{
+		{files, "a.txt", "files'"},
+		{files, "shared.txt", "in files"},
+		{images, "logo.png", "images'"},
+		{images, "shared.txt", "in images"},
+	} {
+		if body, err := check.e.read(t, check.key); err != nil || body != check.body {
+			t.Fatalf("%s in %s: %q %v", check.key, check.e.bucket, body, err)
+		}
+	}
+
+	if _, err := files.read(t, "logo.png"); !notFound(err) {
+		t.Fatalf("another bucket's object: %v", err)
+	}
+
+	files.remove(t, "shared.txt")
+
+	if body, _ := images.read(t, "shared.txt"); body != "in images" {
+		t.Fatalf("a delete in one bucket hid another's: %q", body)
+	}
+
+	if keys, _ := listV2(t, files.app, files.bucket, "", "", 0); !slices.Equal(keys, []string{"a.txt"}) {
+		t.Fatalf("files: %v", keys)
+	}
+
+	if keys, _ := listV2(t, images.app, images.bucket, "", "", 0); !slices.Equal(keys, []string{"logo.png", "shared.txt"}) {
+		t.Fatalf("images: %v", keys)
+	}
+
+	_, err := files.app.CopyObject(ctx, &awss3.CopyObjectInput{
+		Bucket:     aws.String(files.bucket),
+		Key:        aws.String("logo-copy.png"),
+		CopySource: aws.String(images.bucket + "/logo.png"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if body, err := files.read(t, "logo-copy.png"); err != nil || body != "images'" {
+		t.Fatalf("copy across buckets: %q %v", body, err)
+	}
+
+	_, err = client(floci, testCredentials).HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(images.bucket), Key: aws.String("logo.png")})
+	if err != nil {
+		t.Fatalf("the source wasn't copied up in its own bucket: %v", err)
 	}
 }
 
@@ -750,4 +828,26 @@ func hierarchy(names []string, prefix string) (keys, prefixes []string) {
 	}
 
 	return keys, prefixes
+}
+
+// dockerPort is the address a container's port is published at, waiting a
+// little for it; a container that stopped instead says why, in its logs.
+func dockerPort(id, port string) (string, error) {
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		out, err := exec.Command("docker", "port", id, port).Output()
+		if err == nil {
+			return strings.TrimSpace(strings.Split(string(out), "\n")[0]), nil
+		}
+
+		if time.Now().After(deadline) {
+			state, _ := exec.Command("docker", "inspect", "-f", "{{.State.Status}} (exit {{.State.ExitCode}})", id).CombinedOutput()
+			logs, _ := exec.Command("docker", "logs", "--tail", "40", id).CombinedOutput()
+
+			return "", fmt.Errorf("docker port %s: %w; the container is %s; its logs:\n%s", port, err, strings.TrimSpace(string(state)), logs)
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
 }
