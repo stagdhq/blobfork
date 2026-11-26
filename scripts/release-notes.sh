@@ -57,10 +57,10 @@ cat <<MD
 
 \`\`\`bash
 docker pull ghcr.io/stagdhq/blobfork-azure:$version   # with Azurite inside
-docker pull ghcr.io/stagdhq/blobfork-s3:$version      # with Floci inside
+docker pull ghcr.io/stagdhq/blobfork-s3:$version      # with versitygw inside
 \`\`\`
 
-The binaries below run beside an Azurite or Floci of your own: \`blobfork azure serve\`, \`blobfork s3 serve\`.
+The binaries below run beside an Azurite or versitygw of your own: \`blobfork azure serve\`, \`blobfork s3 serve\`.
 MD
 
 if [ -n "$prev" ]; then

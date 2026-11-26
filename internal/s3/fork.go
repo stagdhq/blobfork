@@ -21,13 +21,14 @@ import (
 	"github.com/stagdhq/blobfork/internal/telemetry"
 )
 
-// Config is what a fork needs: Floci, the credentials the app signs with,
+// Config is what a fork needs: versitygw, the credentials the app signs with,
 // and the buckets to fork with the layers under them.
 type Config struct {
-	// Floci is Floci's endpoint, e.g. http://127.0.0.1:4567. It must check
-	// signatures (FLOCI_AUTH_VALIDATE_SIGNATURES=true): a request Floci
-	// answers 404 is one the app may read through.
-	Floci string
+	// Versitygw is versitygw's endpoint, e.g. http://127.0.0.1:7070, with
+	// the app's credentials as its root account: it checks the app's
+	// signatures, so a request it answers 404 is one the app may read
+	// through.
+	Versitygw string
 
 	// Credentials and Region are what the app signs with, and blobfork too.
 	Credentials aws.Credentials
@@ -39,14 +40,14 @@ type Config struct {
 	// directly could set it.
 	TrustForwardedHost bool
 
-	// Buckets are the forked buckets by their names in Floci, usually the
+	// Buckets are the forked buckets by their names in versitygw, usually the
 	// real ones', each with the real bucket under it.
 	Buckets map[string]Layer
 
 	Log *slog.Logger
 }
 
-// Fork is the proxy: requests pass through to Floci, and those on a forked
+// Fork is the proxy: requests pass through to versitygw, and those on a forked
 // bucket that the fork can't answer alone are answered with the lower layer.
 type Fork struct {
 	Config
@@ -56,7 +57,7 @@ type Fork struct {
 	proxy   *httputil.ReverseProxy
 }
 
-// forked is one bucket blobfork forks: the fork's, in Floci, and the real one
+// forked is one bucket blobfork forks: the fork's, in versitygw, and the real one
 // under it.
 type forked struct {
 	name    string
@@ -74,12 +75,12 @@ const HealthPath = "/_blobfork/health"
 // them. blobfork leaves it out of ListBuckets.
 const HiddenBucket = "blobfork-deleted"
 
-// New makes a fork: it waits for Floci, makes the forked buckets and the
+// New makes a fork: it waits for versitygw, makes the forked buckets and the
 // hidden one if they aren't there, and reads the delete markers.
 func New(ctx context.Context, cfg Config) (*Fork, error) {
-	target, err := url.Parse(strings.TrimRight(cfg.Floci, "/"))
+	target, err := url.Parse(strings.TrimRight(cfg.Versitygw, "/"))
 	if err != nil {
-		return nil, fmt.Errorf("floci: %w", err)
+		return nil, fmt.Errorf("versitygw: %w", err)
 	}
 
 	bucket := func(name string) *Bucket {
@@ -114,7 +115,7 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 
-			// SigV4 signs the host: Floci checks the app's. Rewrite drops
+			// SigV4 signs the host: versitygw checks the app's. Rewrite drops
 			// the X-Forwarded headers on the way.
 			r.Out.Host = r.In.Host
 		},
@@ -136,7 +137,7 @@ func New(ctx context.Context, cfg Config) (*Fork, error) {
 	return f, nil
 }
 
-// start makes the buckets, waiting for Floci to come up, and reads the
+// start makes the buckets, waiting for versitygw to come up, and reads the
 // markers.
 func (f *Fork) start(ctx context.Context) error {
 	deadline := time.Now().Add(time.Minute)
@@ -148,7 +149,7 @@ func (f *Fork) start(ctx context.Context) error {
 		}
 
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("floci: %w", err)
+			return fmt.Errorf("versitygw: %w", err)
 		}
 
 		select {
@@ -241,14 +242,15 @@ func (f *Fork) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// SigV4 signs the host the app sent to. Behind a proxy that passes on a
 	// host of its own, that's X-Forwarded-Host; the first, if several
-	// proxies added one. Floci then checks against it, presigned URLs too.
+	// proxies added one. versitygw then checks against it, presigned URLs too.
 	if forwarded := r.Header.Get("X-Forwarded-Host"); f.TrustForwardedHost && forwarded != "" {
 		host, _, _ := strings.Cut(forwarded, ",")
 		r.Host = strings.TrimSpace(host)
 	}
 
-	// Floci takes unsigned requests; blobfork doesn't, as a request Floci
-	// answers is one the app may read through. A browser's preflight and a
+	// blobfork takes only signed requests, as a request versitygw answers is
+	// one the app may read through: an unsigned one would be anonymous, which
+	// a bucket policy in the fork could let in. A browser's preflight and a
 	// form upload (which signs its policy) pass.
 	if !signed(r) && r.Method != http.MethodOptions && !formUpload(r) {
 		f.refuse(w, http.StatusForbidden, "AccessDenied", "blobfork takes requests signed with SigV4.")
@@ -378,14 +380,14 @@ func onlyQuery(query url.Values, allowed func(string) bool) bool {
 	return true
 }
 
-// health answers HealthPath: Floci answers for the hidden bucket.
+// health answers HealthPath: versitygw answers for the hidden bucket.
 func (f *Fork) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
 	res, err := f.hidden.Do(ctx, http.MethodHead, "", nil, nil, nil, 0)
 	if err != nil {
-		http.Error(w, "floci: "+err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "versitygw: "+err.Error(), http.StatusServiceUnavailable)
 
 		return
 	}
@@ -393,7 +395,7 @@ func (f *Fork) health(w http.ResponseWriter, r *http.Request) {
 	res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		http.Error(w, "floci: "+res.Status, http.StatusServiceUnavailable)
+		http.Error(w, "versitygw: "+res.Status, http.StatusServiceUnavailable)
 
 		return
 	}
@@ -468,7 +470,7 @@ func (f *Fork) sourceKey(source string) (*forked, string, bool) {
 	return b, key, ok && key != ""
 }
 
-// modify steps in on Floci's answer, where the lower layer has a say.
+// modify steps in on versitygw's answer, where the lower layer has a say.
 func (f *Fork) modify(res *http.Response) error {
 	rt, ok := res.Request.Context().Value(routeKey{}).(route)
 	if !ok {
@@ -496,7 +498,7 @@ func (f *Fork) modify(res *http.Response) error {
 }
 
 // read answers a read the fork can't from the lower layer, unless a marker
-// hides it. Floci checks the signature first, so a 404 means the app may
+// hides it. versitygw checks the signature first, so a 404 means the app may
 // read.
 func (f *Fork) read(res *http.Response, rt route) error {
 	if res.StatusCode != http.StatusNotFound || rt.b.markers.has(rt.key) {
@@ -545,7 +547,7 @@ func (f *Fork) read(res *http.Response, rt route) error {
 }
 
 // delete leaves a marker where the lower layer has the object, so it stays
-// deleted. Floci answers 204 either way, as S3 does.
+// deleted. versitygw answers 204 either way, as S3 does.
 func (f *Fork) delete(res *http.Response, rt route) error {
 	if res.StatusCode/100 != 2 {
 		return nil
@@ -554,7 +556,7 @@ func (f *Fork) delete(res *http.Response, rt route) error {
 	return rt.b.hide(res.Request.Context(), rt.key)
 }
 
-// deleteMany leaves markers for the keys of a DeleteObjects that Floci
+// deleteMany leaves markers for the keys of a DeleteObjects that versitygw
 // deleted, or had nothing to delete for.
 func (f *Fork) deleteMany(res *http.Response, rt route) error {
 	if res.StatusCode != http.StatusOK {
@@ -628,7 +630,7 @@ func (b *forked) hide(ctx context.Context, key string) error {
 	return b.markers.add(ctx, key)
 }
 
-// list answers ListObjects with both layers merged, once Floci has said the
+// list answers ListObjects with both layers merged, once versitygw has said the
 // app may list.
 func (f *Fork) list(res *http.Response, rt route) error {
 	if res.StatusCode != http.StatusOK {
@@ -695,19 +697,43 @@ func (f *Fork) listBuckets(res *http.Response) error {
 		return err
 	}
 
-	start := bytes.Index(body, []byte("<Bucket><Name>"+HiddenBucket+"</Name>"))
-	if start >= 0 {
-		end := bytes.Index(body[start:], []byte("</Bucket>"))
-		if end >= 0 {
-			body = append(body[:start:start], body[start+end+len("</Bucket>"):]...)
-		}
-	}
+	body = withoutBucket(body, HiddenBucket)
 
 	res.Body = io.NopCloser(bytes.NewReader(body))
 	res.ContentLength = int64(len(body))
 	res.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
 	return nil
+}
+
+// withoutBucket leaves the <Bucket> element named name out of a ListBuckets
+// answer, whatever the order of its elements and the space between them: a
+// bucket's name has nothing XML escapes, so its <Name> is the name as it is.
+func withoutBucket(body []byte, name string) []byte {
+	open, end := []byte("<Bucket>"), []byte("</Bucket>")
+	want := []byte("<Name>" + name + "</Name>")
+
+	for from := 0; ; {
+		start := bytes.Index(body[from:], open)
+		if start < 0 {
+			return body
+		}
+
+		start += from
+
+		length := bytes.Index(body[start:], end)
+		if length < 0 {
+			return body
+		}
+
+		stop := start + length + len(end)
+
+		if bytes.Contains(body[start:stop], want) {
+			return append(body[:start:start], body[stop:]...)
+		}
+
+		from = stop
+	}
 }
 
 // inLower says whether the lower layer has an object.

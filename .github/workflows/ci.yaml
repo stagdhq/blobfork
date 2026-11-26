@@ -1,5 +1,5 @@
 # Every push to main and every pull request: formatted, vetted, built, and
-# tested. The tests start Azurite and two Flocis with Docker, which the runner
+# tested. The tests start Azurite and two versitygws with Docker, which the runner
 # has; both images are built too, not pushed.
 name: CI
 

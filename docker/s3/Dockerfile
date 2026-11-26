@@ -1,5 +1,5 @@
-# blobfork's S3 front beside Floci, in one image: Floci listens inside on
-# 4567, checking signatures, and blobfork in front of it on 4566.
+# blobfork's S3 front beside versitygw, in one image: versitygw listens
+# inside on 7070, checking signatures, and blobfork in front of it on 4566.
 #
 #   docker build -f docker/s3/Dockerfile -t blobfork-s3 .
 
@@ -15,15 +15,16 @@ COPY . .
 
 ARG VERSION=dev
 ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-s -w -X main.version=${VERSION}" -o /blobfork ./cmd/blobfork
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /blobfork ./cmd/blobfork
 
-FROM floci/floci:2.4.0
+FROM versity/versitygw:v1.11.0
 
 COPY --from=build /blobfork /usr/local/bin/blobfork
 COPY docker/s3/entrypoint.sh /usr/local/bin/blobfork-entrypoint
 COPY LICENSE /usr/share/licenses/blobfork/LICENSE
-COPY docker/licenses/floci.txt /usr/share/licenses/floci/LICENSE
+COPY docker/licenses/versitygw/ /usr/share/licenses/versitygw/
 
+VOLUME /data
 EXPOSE 4566
 
 # Up once blobfork serves and its emulator answers.

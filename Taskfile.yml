@@ -24,7 +24,7 @@ tasks:
       - gofmt -w cmd internal
 
   test:
-    desc: Run the tests (they start Azurite and Floci with Docker)
+    desc: Run the tests (they start Azurite and versitygw with Docker)
     cmds:
       - go test ./...
 

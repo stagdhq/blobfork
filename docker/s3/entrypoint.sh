@@ -1,25 +1,31 @@
 #!/bin/sh
-# Starts Floci inside, with only S3 in use and checking signatures, and
-# blobfork in front of it; when either stops, so does the container.
+# Starts versitygw inside, over the files in /data and checking signatures
+# with the app's key, and blobfork in front of it; when either stops, so does
+# the container.
 set -e
 
-export FLOCI_AUTH_VALIDATE_SIGNATURES=true
-export BLOBFORK_FLOCI="${BLOBFORK_FLOCI:-http://127.0.0.1:4567}"
+export BLOBFORK_VERSITYGW="${BLOBFORK_VERSITYGW:-http://127.0.0.1:7070}"
 
-# Floci's own entrypoint, which runs it as its own user.
-/usr/local/bin/docker-entrypoint.sh /app/application \
-  -Dquarkus.http.host=127.0.0.1 \
-  -Dquarkus.http.port=4567 &
-floci=$!
+# Buckets are directories of /data/buckets; their objects' metadata is kept
+# beside them in /data/meta, so the filesystem needn't take extended
+# attributes.
+mkdir -p /data/buckets /data/meta
+
+ROOT_ACCESS_KEY="${BLOBFORK_ACCESS_KEY_ID:-test}" \
+ROOT_SECRET_KEY="${BLOBFORK_SECRET_ACCESS_KEY:-test}" \
+VGW_REGION="${BLOBFORK_REGION:-us-east-1}" \
+  versitygw --port 127.0.0.1:7070 --quiet \
+    posix --sidecar /data/meta /data/buckets &
+versitygw=$!
 
 blobfork s3 serve "$@" &
 blobfork=$!
 
-trap 'kill $floci $blobfork 2>/dev/null' INT TERM
+trap 'kill $versitygw $blobfork 2>/dev/null' INT TERM
 
-while kill -0 $floci 2>/dev/null && kill -0 $blobfork 2>/dev/null; do
+while kill -0 $versitygw 2>/dev/null && kill -0 $blobfork 2>/dev/null; do
   sleep 1
 done
 
-kill $floci $blobfork 2>/dev/null || true
+kill $versitygw $blobfork 2>/dev/null || true
 wait $blobfork || exit $?

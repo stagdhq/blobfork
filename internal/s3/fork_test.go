@@ -24,31 +24,31 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-// The tests run the AWS SDK against blobfork in front of Floci, with a second
-// Floci holding the real bucket. BLOBFORK_TEST_FLOCI and
-// BLOBFORK_TEST_FLOCI_LAB name running ones (both checking signatures, with
-// the keys test/test); otherwise the tests start them with Docker.
+// The tests run the AWS SDK against blobfork in front of versitygw, with a
+// second versitygw holding the real bucket. BLOBFORK_TEST_VERSITYGW and
+// BLOBFORK_TEST_VERSITYGW_LAB name running ones (both with the root keys
+// test/test); otherwise the tests start them with Docker.
 
-const flociImage = "floci/floci:2.4.0"
+const versitygwImage = "versity/versitygw:v1.11.0"
 
 var (
-	floci, flociLab string
-	sequence        atomic.Int64
+	versitygw, versitygwLab string
+	sequence                atomic.Int64
 
 	testCredentials = aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}
 )
 
 func TestMain(m *testing.M) {
-	floci = os.Getenv("BLOBFORK_TEST_FLOCI")
-	flociLab = os.Getenv("BLOBFORK_TEST_FLOCI_LAB")
+	versitygw = os.Getenv("BLOBFORK_TEST_VERSITYGW")
+	versitygwLab = os.Getenv("BLOBFORK_TEST_VERSITYGW_LAB")
 
-	if floci == "" || flociLab == "" {
+	if versitygw == "" || versitygwLab == "" {
 		var stops []func()
 
-		for _, target := range []*string{&floci, &flociLab} {
-			endpoint, stop, err := startFloci()
+		for _, target := range []*string{&versitygw, &versitygwLab} {
+			endpoint, stop, err := startVersitygw()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "blobfork tests need Floci:", err)
+				fmt.Fprintln(os.Stderr, "blobfork tests need versitygw:", err)
 				os.Exit(1)
 			}
 
@@ -68,13 +68,17 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func startFloci() (string, func(), error) {
+// startVersitygw runs versitygw as the image does: buckets in one directory,
+// their metadata beside them.
+func startVersitygw() (string, func(), error) {
 	out, err := exec.Command(
 		"docker", "run", "-d",
-		"-p", "127.0.0.1::4566",
-		"-e", "FLOCI_AUTH_VALIDATE_SIGNATURES=true",
-		"-e", "FLOCI_STORAGE_MODE=memory",
-		flociImage,
+		"-p", "127.0.0.1::7070",
+		"-e", "ROOT_ACCESS_KEY=test",
+		"-e", "ROOT_SECRET_KEY=test",
+		"--entrypoint", "sh",
+		versitygwImage,
+		"-c", "mkdir -p /data/buckets /data/meta && exec versitygw --quiet posix --sidecar /data/meta /data/buckets",
 	).Output()
 	if err != nil {
 		return "", nil, fmt.Errorf("docker run: %w: %s", err, stderr(err))
@@ -84,7 +88,7 @@ func startFloci() (string, func(), error) {
 	id := strings.TrimSpace(string(out))
 	stop := func() { exec.Command("docker", "rm", "-f", id).Run() }
 
-	address, err := dockerPort(id, "4566/tcp")
+	address, err := dockerPort(id, "7070/tcp")
 	if err != nil {
 		stop()
 
@@ -123,7 +127,7 @@ func setupMany(t *testing.T, n int) []*env {
 
 	ctx := t.Context()
 
-	lab := client(flociLab, testCredentials)
+	lab := client(versitygwLab, testCredentials)
 
 	buckets := map[string]Layer{}
 	envs := make([]*env, n)
@@ -131,7 +135,7 @@ func setupMany(t *testing.T, n int) []*env {
 	for i := range envs {
 		bucket := fmt.Sprintf("files-%d-%d", time.Now().UnixNano()%1e6, sequence.Add(1))
 
-		// Floci may still be starting.
+		// versitygw may still be starting.
 		deadline := time.Now().Add(time.Minute)
 
 		for {
@@ -148,7 +152,7 @@ func setupMany(t *testing.T, n int) []*env {
 		}
 
 		buckets[bucket] = &Bucket{
-			Endpoint:    flociLab,
+			Endpoint:    versitygwLab,
 			Name:        bucket,
 			Region:      "us-east-1",
 			PathStyle:   true,
@@ -159,7 +163,7 @@ func setupMany(t *testing.T, n int) []*env {
 	}
 
 	fork, err := New(ctx, Config{
-		Floci:       floci,
+		Versitygw:   versitygw,
 		Credentials: testCredentials,
 		Region:      "us-east-1",
 		Buckets:     buckets,
@@ -390,6 +394,103 @@ func TestWritesStayInFork(t *testing.T) {
 	}
 }
 
+// Uploads as apps and browsers make them, which the emulator answers alone:
+// a multipart upload, a PUT to a presigned URL, and a CORS preflight against
+// the bucket's CORS rules.
+func TestUploads(t *testing.T) {
+	e := setup(t)
+	e.seed(t, map[string]string{"a.txt": "lab's"})
+
+	ctx := t.Context()
+
+	created, err := e.app.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{Bucket: aws.String(e.bucket), Key: aws.String("a.txt")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts := []string{strings.Repeat("x", 5<<20), "tail"}
+	completed := make([]types.CompletedPart, len(parts))
+
+	for i, part := range parts {
+		uploaded, err := e.app.UploadPart(ctx, &awss3.UploadPartInput{
+			Bucket:     aws.String(e.bucket),
+			Key:        aws.String("a.txt"),
+			UploadId:   created.UploadId,
+			PartNumber: aws.Int32(int32(i + 1)),
+			Body:       strings.NewReader(part),
+		})
+		if err != nil {
+			t.Fatalf("part %d: %v", i+1, err)
+		}
+
+		completed[i] = types.CompletedPart{ETag: uploaded.ETag, PartNumber: aws.Int32(int32(i + 1))}
+	}
+
+	_, err = e.app.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(e.bucket),
+		Key:             aws.String("a.txt"),
+		UploadId:        created.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if body, err := e.read(t, "a.txt"); err != nil || body != parts[0]+parts[1] {
+		t.Fatalf("multipart: %d bytes, %v", len(body), err)
+	}
+
+	presigned, err := awss3.NewPresignClient(e.app).PresignPutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(e.bucket), Key: aws.String("upload.txt")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	put, _ := http.NewRequestWithContext(ctx, http.MethodPut, presigned.URL, strings.NewReader("from a browser"))
+
+	res, err := http.DefaultClient.Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("presigned put: %d", res.StatusCode)
+	}
+
+	if body, _ := e.read(t, "upload.txt"); body != "from a browser" {
+		t.Fatalf("presigned put: %q", body)
+	}
+
+	_, err = e.app.PutBucketCors(ctx, &awss3.PutBucketCorsInput{
+		Bucket: aws.String(e.bucket),
+		CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{{
+			AllowedOrigins: []string{"https://app.example.com"},
+			AllowedMethods: []string{"PUT", "GET"},
+			AllowedHeaders: []string{"*"},
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preflight, _ := http.NewRequestWithContext(ctx, http.MethodOptions, e.proxy.URL+"/"+e.bucket+"/upload.txt", nil)
+	preflight.Header.Set("Origin", "https://app.example.com")
+	preflight.Header.Set("Access-Control-Request-Method", "PUT")
+	preflight.Header.Set("Access-Control-Request-Headers", "content-type")
+
+	res, err = http.DefaultClient.Do(preflight)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK || res.Header.Get("Access-Control-Allow-Origin") != "https://app.example.com" {
+		t.Fatalf("preflight: %d %q", res.StatusCode, res.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
 // Deletes, one at a time or many at once, hide the real bucket's objects
 // until the app writes them again.
 func TestDeletesHide(t *testing.T) {
@@ -433,7 +534,7 @@ func TestDeletesHide(t *testing.T) {
 		t.Fatalf("written again: %q", body)
 	}
 
-	// Markers outlast blobfork: a new one over the same Floci reads them.
+	// Markers outlast blobfork: a new one over the same versitygw reads them.
 	again, err := New(ctx, e.fork.Config)
 	if err != nil {
 		t.Fatal(err)
@@ -475,7 +576,7 @@ func TestCopyFromLower(t *testing.T) {
 	}
 
 	// The source was copied up, with lab's headers and metadata.
-	head, err := client(floci, testCredentials).HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(e.bucket), Key: aws.String("template.docx")})
+	head, err := client(versitygw, testCredentials).HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(e.bucket), Key: aws.String("template.docx")})
 	if err != nil {
 		t.Fatalf("not copied up: %v", err)
 	}
@@ -598,7 +699,7 @@ func TestSeveralBuckets(t *testing.T) {
 		t.Fatalf("copy across buckets: %q %v", body, err)
 	}
 
-	_, err = client(floci, testCredentials).HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(images.bucket), Key: aws.String("logo.png")})
+	_, err = client(versitygw, testCredentials).HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(images.bucket), Key: aws.String("logo.png")})
 	if err != nil {
 		t.Fatalf("the source wasn't copied up in its own bucket: %v", err)
 	}

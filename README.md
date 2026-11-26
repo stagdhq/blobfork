@@ -12,7 +12,7 @@ It's made for preview environments. A preview with a branch of your staging data
 
 blobfork is a small proxy in front of an emulator, with two layers behind it:
 
-- **The fork,** in the emulator: every write goes here. [Azurite](https://github.com/Azure/Azurite) for Azure, [Floci](https://floci.io) for S3.
+- **The fork,** in the emulator: every write goes here. [Azurite](https://github.com/Azure/Azurite) for Azure, [versitygw](https://github.com/versity/versitygw) (an S3 server over local files) for S3.
 - **The real container or bucket,** read-only: a read the fork can't answer falls through to it.
 
 Each front sits over its own kind: an Azure container under the Azure front, an S3 bucket (AWS, R2, MinIO, …) under the S3 one. Nothing is translated.
@@ -29,7 +29,7 @@ SAS URLs and presigned URLs your app hands a browser, for direct uploads and dow
 
 The real container is read with a SAS that can only read and list, and the real bucket with a key that should only read and list, so the fork can't write to it, whatever the app asks.
 
-blobfork answers from the real one only for a request the emulator has checked: the emulator's 404 means the app's key or signature was good. Floci takes unsigned requests, so blobfork refuses them before they reach it.
+blobfork answers from the real one only for a request the emulator has checked: the emulator's 404 means the app's key or signature was good. An unsigned request would be anonymous, which a bucket policy in the fork could let in, so the S3 front refuses them before they reach versitygw.
 
 Delete markers are empty files in a container or bucket of the fork's own, `blobfork-deleted`, which blobfork leaves out of List Containers and ListBuckets; they last as long as the emulator's data does.
 
@@ -104,9 +104,9 @@ services:
       AWS_REGION: us-east-1
 ```
 
-Each bucket in the fork keeps the real one's name; `<name>=s3://<bucket>` forks one under another name. The real buckets are all read at the one endpoint, with the one key. The app signs with Floci's keys, `test` and `test`, and addresses the bucket in the path (`forcePathStyle: true`, `UsePathStyle`, `s3ForcePathStyle` or the like in its SDK): blobfork answers at one host, not one per bucket. The real buckets' key never leaves blobfork.
+Each bucket in the fork keeps the real one's name; `<name>=s3://<bucket>` forks one under another name. The real buckets are all read at the one endpoint, with the one key. The app signs with `test` and `test` unless you set `BLOBFORK_ACCESS_KEY_ID` and `BLOBFORK_SECRET_ACCESS_KEY`, and addresses the bucket in the path (`forcePathStyle: true`, `UsePathStyle`, `s3ForcePathStyle` or the like in its SDK): blobfork answers at one host, not one per bucket. The real buckets' key never leaves blobfork.
 
-The image runs Floci inside, on 4567 and checking signatures, with blobfork in front of it on 4566. Floci keeps its data in memory unless you set `FLOCI_STORAGE_MODE` (`persistent` keeps it in `/app/data`).
+The image runs versitygw inside, on 7070 with the app's key as its root account's, and blobfork in front of it on 4566. versitygw keeps the fork's objects as files in `/data/buckets` and their metadata beside them in `/data/meta`, so the filesystem needn't take extended attributes.
 
 `blobfork s3 serve` takes each setting as a flag or from its variable:
 
@@ -119,23 +119,23 @@ The image runs Floci inside, on 4567 and checking signatures, with blobfork in f
 | `--from-access-key-id` | `BLOBFORK_FROM_ACCESS_KEY_ID` | | A key that can read and list them, and nothing more. Required. |
 | `--from-secret-access-key` | `BLOBFORK_FROM_SECRET_ACCESS_KEY` | | Its secret. Required. |
 | `--from-session-token` | `BLOBFORK_FROM_SESSION_TOKEN` | | Its session token, for temporary credentials. |
-| `--access-key-id` | `BLOBFORK_ACCESS_KEY_ID` | `test` | The key the app signs with, Floci's. |
+| `--access-key-id` | `BLOBFORK_ACCESS_KEY_ID` | `test` | The key the app signs with, versitygw's root account's. |
 | `--secret-access-key` | `BLOBFORK_SECRET_ACCESS_KEY` | `test` | Its secret. |
 | `--region` | `BLOBFORK_REGION` | `us-east-1` | The region the app signs for. |
 | `--listen` | `BLOBFORK_LISTEN` | `:4566` | Where the app reaches blobfork. |
 | `--trust-forwarded-host` | `BLOBFORK_TRUST_FORWARDED_HOST` | off | Check signatures, presigned URLs too, against `X-Forwarded-Host`: for blobfork behind a proxy that passes on a host of its own. Only behind one, as anyone reaching blobfork directly could set it. |
-| `--floci` | `BLOBFORK_FLOCI` | `http://127.0.0.1:4567` | Floci's endpoint. |
+| `--versitygw` | `BLOBFORK_VERSITYGW` | `http://127.0.0.1:7070` | versitygw's endpoint. |
 | `--log-level` | `BLOBFORK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. |
 
 SigV4 signs the host the app sends to, so blobfork has to see that host: directly, or in `X-Forwarded-Host` with `--trust-forwarded-host`. Azure's signatures don't cover the host, so the Azure front needs neither.
 
 `blobfork s3 check` takes the `--from` flags, lists each real bucket and reads an object of it. It can't tell whether the key could also write: that's for the key's policy.
 
-Run outside the image, blobfork needs a Floci that checks signatures (`FLOCI_AUTH_VALIDATE_SIGNATURES=true`) and that only blobfork can reach.
+Run outside the image, blobfork needs a versitygw whose root account has the app's key (`ROOT_ACCESS_KEY` and `ROOT_SECRET_KEY`), in the region the app signs for (`VGW_REGION`), and that only blobfork can reach.
 
 ### Health
 
-`blobfork azure health` and `blobfork s3 health` exit 0 once blobfork serves at `--listen` and its emulator answers (Azurite for the account and its key, Floci for its bucket), for a container's health check; both images use them as theirs. In `docker compose`:
+`blobfork azure health` and `blobfork s3 health` exit 0 once blobfork serves at `--listen` and its emulator answers (Azurite for the account and its key, versitygw for its bucket), for a container's health check; both images use them as theirs. In `docker compose`:
 
 ```yaml
     healthcheck:
@@ -209,8 +209,8 @@ go test ./...
 
 [Task](https://taskfile.dev) is pinned in `go.mod`: `go tool task check` runs what CI does, `go tool task image` builds both images, and `go tool task --list` shows the rest. A `v*` tag releases: the binaries and checksums on its GitHub release, and both images on ghcr.io.
 
-The tests run the Azure SDK and the AWS SDK against blobfork in front of the emulators, which they start with Docker: one Azurite (`mcr.microsoft.com/azure-storage/azurite:3.35.0`) with a second account in it holding the real container, and two Flocis (`floci/floci:2.4.0`), one holding the real bucket. `BLOBFORK_TEST_AZURITE`, `BLOBFORK_TEST_FLOCI` and `BLOBFORK_TEST_FLOCI_LAB` point them at running ones instead.
+The tests run the Azure SDK and the AWS SDK against blobfork in front of the emulators, which they start with Docker: one Azurite (`mcr.microsoft.com/azure-storage/azurite:3.35.0`) with a second account in it holding the real container, and two versitygws (`versity/versitygw:v1.11.0`), one holding the real bucket. `BLOBFORK_TEST_AZURITE`, `BLOBFORK_TEST_VERSITYGW` and `BLOBFORK_TEST_VERSITYGW_LAB` point them at running ones instead.
 
 ## License
 
-blobfork is licensed under the [Apache License 2.0](LICENSE). The images also hold Azurite and Floci, each under its own MIT license: Azurite's in `/opt/azurite/LICENSE`, Floci's in `/usr/share/licenses/floci/LICENSE`.
+blobfork is licensed under the [Apache License 2.0](LICENSE). The images also hold Azurite and versitygw, each under its own license: Azurite's (MIT) in `/opt/azurite/LICENSE`, versitygw's (Apache 2.0) with its notice in `/usr/share/licenses/versitygw/`.

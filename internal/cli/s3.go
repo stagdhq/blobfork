@@ -14,15 +14,15 @@ import (
 	"github.com/stagdhq/blobfork/internal/s3"
 )
 
-// s3Command is the S3 front: forks of buckets, in front of Floci.
+// s3Command is the S3 front: forks of buckets, in front of versitygw.
 func s3Command(version string) *cli.Command {
 	return &cli.Command{
 		Name:  "s3",
-		Usage: "fork S3 buckets (AWS, R2, MinIO, …), in front of Floci",
+		Usage: "fork S3 buckets (AWS, R2, MinIO, …), in front of versitygw",
 		Commands: []*cli.Command{
 			s3ServeCommand(version),
 			s3CheckCommand(),
-			healthCommand("Floci", ":4566", s3.HealthPath),
+			healthCommand("versitygw", ":4566", s3.HealthPath),
 		},
 	}
 }
@@ -127,9 +127,9 @@ func s3Lowers(cmd *cli.Command) (map[string]*s3.Bucket, error) {
 func s3ServeCommand(version string) *cli.Command {
 	return &cli.Command{
 		Name:  "serve",
-		Usage: "serve the fork: the app's S3 endpoint, in front of Floci",
-		Description: "Requests pass through to Floci, which must check signatures\n" +
-			"(FLOCI_AUTH_VALIDATE_SIGNATURES=true). Reads the fork can't answer come from the\n" +
+		Usage: "serve the fork: the app's S3 endpoint, in front of versitygw",
+		Description: "Requests pass through to versitygw, which checks signatures with the app's\n" +
+			"key as its root account's. Reads the fork can't answer come from the\n" +
 			"real bucket, deletes of its objects leave a marker, listings merge both, and copies\n" +
 			"from it copy the object up first. The real buckets are never written.",
 		DisableSliceFlagSeparator: true,
@@ -141,14 +141,14 @@ func s3ServeCommand(version string) *cli.Command {
 				Sources: cli.EnvVars("BLOBFORK_TRUST_FORWARDED_HOST"),
 			},
 			&cli.StringFlag{
-				Name:    "floci",
-				Usage:   "Floci's endpoint",
-				Value:   "http://127.0.0.1:4567",
-				Sources: cli.EnvVars("BLOBFORK_FLOCI"),
+				Name:    "versitygw",
+				Usage:   "versitygw's endpoint",
+				Value:   "http://127.0.0.1:7070",
+				Sources: cli.EnvVars("BLOBFORK_VERSITYGW"),
 			},
 			&cli.StringFlag{
 				Name:    "access-key-id",
-				Usage:   "the access key the app signs with, Floci's",
+				Usage:   "the access key the app signs with, versitygw's root account's",
 				Value:   "test",
 				Sources: cli.EnvVars("BLOBFORK_ACCESS_KEY_ID"),
 			},
@@ -186,7 +186,7 @@ func s3ServeCommand(version string) *cli.Command {
 			}
 
 			fork, err := s3.New(ctx, s3.Config{
-				Floci: cmd.String("floci"),
+				Versitygw: cmd.String("versitygw"),
 				Credentials: aws.Credentials{
 					AccessKeyID:     cmd.String("access-key-id"),
 					SecretAccessKey: cmd.String("secret-access-key"),

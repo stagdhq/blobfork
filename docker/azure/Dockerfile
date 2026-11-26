@@ -15,7 +15,7 @@ COPY . .
 
 ARG VERSION=dev
 ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-s -w -X main.version=${VERSION}" -o /blobfork ./cmd/blobfork
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /blobfork ./cmd/blobfork
 
 FROM mcr.microsoft.com/azure-storage/azurite:3.35.0
 

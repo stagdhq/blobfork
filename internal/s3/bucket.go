@@ -1,5 +1,5 @@
-// Package s3 is blobfork's S3 front: a proxy in front of Floci that forks one
-// bucket, with the real bucket as a read-only layer under it.
+// Package s3 is blobfork's S3 front: a proxy in front of versitygw that forks
+// buckets, each with the real one as a read-only layer under it.
 package s3
 
 import (
@@ -20,7 +20,7 @@ import (
 )
 
 // Layer is a bucket blobfork reads from: the real one under the fork (the
-// lower layer), or the fork itself in Floci, when blobfork lists it.
+// lower layer), or the fork itself in versitygw, when blobfork lists it.
 //
 // The lower layer is read with credentials of its own for now (Bucket). In a
 // Stagd preview it will be read through Stagd, so the credentials stay there:
@@ -79,10 +79,10 @@ var headersToLower = []string{
 }
 
 // Bucket is a bucket read and written with SigV4 credentials: the real one,
-// with read-only credentials of its own, or the fork in Floci.
+// with read-only credentials of its own, or the fork in versitygw.
 type Bucket struct {
 	// Endpoint is the S3 endpoint, e.g. https://s3.eu-north-1.amazonaws.com,
-	// https://<account>.r2.cloudflarestorage.com or http://127.0.0.1:4567.
+	// https://<account>.r2.cloudflarestorage.com or http://127.0.0.1:7070.
 	Endpoint string
 
 	Name   string
